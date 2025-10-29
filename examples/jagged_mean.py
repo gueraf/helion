@@ -1,6 +1,6 @@
 """
 Jagged Mean Example
-===============
+===================
 
 This example demonstrates how to compute the mean of each row in a jagged tensor
 with variable features per row using Helion.
@@ -9,24 +9,31 @@ with variable features per row using Helion.
 # %%
 # Imports
 # -------
+
+# %%
 from __future__ import annotations
+
+from typing import Callable
 
 import torch
 
 import helion
+from helion._testing import DEVICE
 from helion._testing import run_example
 import helion.language as hl
 
-
 # %%
 # Jagged Mean Kernel
-# ---------------
+# ------------------
+
+
+# %%
 @helion.kernel()
 def jagged_mean_kernel(
     x_data: torch.Tensor,
     x_offsets: torch.Tensor,
     x_feature_counts: torch.Tensor,  # [num_rows] - number of features per row
-    max_M_tensor: torch.Tensor,  # Dummy tensor whose size indicates max features
+    max_M: int,  # Maximum number of features
 ) -> torch.Tensor:
     """
     Compute the mean of each row in a jagged tensor with variable features per row.
@@ -36,14 +43,13 @@ def jagged_mean_kernel(
         x_offsets: (num_rows + 1) tensor. Row i is the slice
                    x_data[x_offsets[i] : x_offsets[i+1], :]
         x_feature_counts: (num_rows) tensor. Number of valid features for each row
-        max_M_tensor: Dummy tensor whose numel() gives max number of features
+        max_M: Maximum number of features
 
     Returns:
         2-D tensor of shape (num_rows, max_M) containing the mean of each row.
         Invalid features (beyond x_feature_counts[i]) are set to 0.
     """
     num_rows = x_offsets.size(0) - 1
-    max_M = max_M_tensor.numel()  # Extract max features from dummy tensor
 
     out = torch.zeros([num_rows, max_M], dtype=x_data.dtype, device=x_data.device)
 
@@ -103,7 +109,10 @@ def jagged_mean_kernel(
 
 # %%
 # Reference Implementation
-# --------------------
+# ------------------------
+
+
+# %%
 def reference_jagged_mean_kernel_pytorch(
     x_data: torch.Tensor,
     x_offsets: torch.Tensor,
@@ -135,14 +144,18 @@ def reference_jagged_mean_kernel_pytorch(
 
 # %%
 # Benchmark Wrapper
-# --------------
+# -----------------
+
+
+# %%
 def jagged_mean_tritonbench(
-    x: torch.Tensor, B: int, M: int, seqlen: int, sparsity: float
-) -> torch.Tensor:
+    tb_op: object, x: torch.Tensor, B: int, M: int, seqlen: int, sparsity: float
+) -> Callable[[], torch.Tensor]:
     """
     Wrapper for tritonbench that matches the expected interface.
 
     Args:
+        tb_op: TritonBench operator instance
         x: Nested tensor in jagged format with shape (B, *, M)
         B: Batch size
         M: Number of features
@@ -150,7 +163,7 @@ def jagged_mean_tritonbench(
         sparsity: Sparsity factor (not used)
 
     Returns:
-        Tensor of shape (B, M) with mean values per row and feature
+        Callable that returns tensor of shape (B, M) with mean values per row and feature
     """
     x_values = x._values
     x_offsets = x._offsets  # pyright: ignore[reportAttributeAccessIssue]
@@ -161,14 +174,15 @@ def jagged_mean_tritonbench(
         dtype=torch.int32,
         device=x_values.device,  # pyright: ignore[reportAttributeAccessIssue]
     )
-    max_M_tensor = torch.empty(M, device=x_values.device)  # pyright: ignore[reportAttributeAccessIssue]
-
-    return jagged_mean_kernel(x_values, x_offsets, feature_counts, max_M_tensor)
+    return lambda: jagged_mean_kernel(x_values, x_offsets, feature_counts, M)
 
 
 # %%
 # Main Function
-# -----------
+# -------------
+
+
+# %%
 def main() -> None:
     """
     Main entry point that runs the jagged mean kernel verification.
@@ -177,7 +191,7 @@ def main() -> None:
     the kernel implementation against the PyTorch reference implementation.
     """
     num_rows, max_cols = 32, 64
-    device = "cuda"
+    device = DEVICE
 
     lengths = torch.randint(1, max_cols + 1, (num_rows,), device=device)
     x_offsets = torch.cat(
@@ -189,12 +203,11 @@ def main() -> None:
     feature_counts = torch.randint(
         1, M + 1, (num_rows,), dtype=torch.int32, device=device
     )
-    max_M_tensor = torch.empty(M, device=device)
 
     run_example(
-        lambda x, o, fc, mt: jagged_mean_kernel(x, o, fc, mt),
-        lambda x, o, fc, mt: reference_jagged_mean_kernel_pytorch(x, o, fc, mt.numel()),
-        (x_data, x_offsets, feature_counts, max_M_tensor),
+        lambda x, o, fc, m: jagged_mean_kernel(x, o, fc, m),
+        lambda x, o, fc, m: reference_jagged_mean_kernel_pytorch(x, o, fc, m),
+        (x_data, x_offsets, feature_counts, M),
     )
 
 

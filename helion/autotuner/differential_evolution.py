@@ -8,6 +8,7 @@ from .base_search import PopulationBasedSearch
 from .base_search import PopulationMember
 from .base_search import performance
 from .base_search import population_statistics
+from .effort_profile import DIFFERENTIAL_EVOLUTION_DEFAULTS
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -26,16 +27,16 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
         self,
         kernel: BoundKernel,
         args: Sequence[object],
-        population_size: int = 40,
-        num_generations: int = 20,
+        population_size: int = DIFFERENTIAL_EVOLUTION_DEFAULTS.population_size,
+        max_generations: int = DIFFERENTIAL_EVOLUTION_DEFAULTS.max_generations,
         crossover_rate: float = 0.8,
         immediate_update: bool | None = None,
     ) -> None:
         super().__init__(kernel, args)
         if immediate_update is None:
-            immediate_update = not kernel.settings.autotune_precompile
+            immediate_update = not bool(kernel.settings.autotune_precompile)
         self.population_size = population_size
-        self.num_generations = num_generations
+        self.max_generations = max_generations
         self.crossover_rate = crossover_rate
         self.immediate_update = immediate_update
 
@@ -81,8 +82,7 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
     def evolve_population(self) -> int:
         replaced = 0
         for i, candidate in self.iter_candidates():
-            candidate = self.benchmark_flat(self.mutate(i))
-            if candidate.perf < self.population[i].perf:
+            if self.compare(candidate, self.population[i]) < 0:
                 self.population[i] = candidate
                 replaced += 1
         return replaced
@@ -91,11 +91,13 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
         self.log(
             lambda: (
                 f"Starting DifferentialEvolutionSearch with population={self.population_size}, "
-                f"generations={self.num_generations}, crossover_rate={self.crossover_rate}"
+                f"generations={self.max_generations}, crossover_rate={self.crossover_rate}"
             )
         )
         self.initial_two_generations()
-        for i in range(2, self.num_generations):
+        for i in range(2, self.max_generations):
+            self.log(f"Generation {i} starting")
             replaced = self.evolve_population()
-            self.log(f"Generation {i}: replaced={replaced}", self.statistics)
+            self.log(f"Generation {i} complete: replaced={replaced}", self.statistics)
+        self.rebenchmark_population()
         return self.best.config

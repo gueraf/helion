@@ -1,6 +1,6 @@
 """
 Attention Example
-========================
+=================
 
 This code implements a custom attention kernel using Helion and PyTorch for efficient computation of scaled dot-product attention,
 with support for both static and dynamic input shapes.
@@ -9,6 +9,8 @@ with support for both static and dynamic input shapes.
 # %%
 # Imports
 # -------
+
+# %%
 from __future__ import annotations
 
 import math
@@ -19,13 +21,16 @@ import torch
 from torch.nn.attention.flex_attention import flex_attention
 
 import helion
+from helion._testing import DEVICE
 from helion._testing import run_example
 import helion.language as hl
 
-
 # %%
 # Attention Kernel Implementation
-# ----------------------------
+# -------------------------------
+
+
+# %%
 @helion.kernel(
     # Static shapes provides a speedup for attention
     static_shapes=True,
@@ -59,7 +64,7 @@ def attention(
     out = torch.empty_like(q_view)
     sm_scale = 1.0 / math.sqrt(head_dim)
     qk_scale = sm_scale * 1.44269504  # 1/log(2)
-    for tile_b, tile_m in hl.tile([q_view.size(0), m_dim], block_size=[1, None]):
+    for tile_b, tile_m in hl.tile([q_view.size(0), m_dim]):
         m_i = hl.full([tile_b, tile_m], float("-inf"), dtype=torch.float32)
         l_i = torch.full_like(m_i, 1.0)
         acc = hl.zeros([tile_b, tile_m, head_dim], dtype=torch.float32)
@@ -86,7 +91,9 @@ def attention(
 
 # %%
 # Dynamic Shape Version
-# ------------------
+# ---------------------
+
+# %%
 attention_dynamic: object = helion.kernel(  # pyright: ignore[reportCallIssue]
     attention.fn,
     configs=attention.configs,  # pyright: ignore[reportArgumentType]
@@ -100,7 +107,10 @@ This version allows for variable input shapes at runtime.
 
 # %%
 # Testing Function
-# -------------
+# ----------------
+
+
+# %%
 def test(
     z: int,
     h: int,
@@ -147,13 +157,16 @@ def test(
 
 # %%
 # Main Function
-# -----------
+# -------------
+
+
+# %%
 def main() -> None:
     """
     Main entry point that runs the attention kernel test with specific parameters.
     Tests with batch size 2, 32 heads, 1024 sequence length, and 64-dimensional heads using float16.
     """
-    test(2, 32, 1024, 64, torch.float16)
+    test(2, 32, 1024, 64, torch.float16, device=DEVICE)
 
 
 if __name__ == "__main__":

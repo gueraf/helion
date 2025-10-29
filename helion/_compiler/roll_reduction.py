@@ -7,12 +7,23 @@ import torch
 from torch.fx import map_arg
 
 from ..language import _MEMORY_OPS
+from ..language import atomic_add
+from ..language import atomic_and
+from ..language import atomic_cas
+from ..language import atomic_max
+from ..language import atomic_min
+from ..language import atomic_or
+from ..language import atomic_xchg
+from ..language import atomic_xor
 from ..language._tracing_ops import _for_loop
 from ..language._tracing_ops import _get_symnode
 from ..language._tracing_ops import _host_tensor
 from ..language._tracing_ops import _if
+from ..language.matmul_ops import dot as hl_dot
 from ..language.memory_ops import store
 from ..language.reduce_ops import _reduce
+from ..language.view_ops import join as hl_join
+from ..language.view_ops import split as hl_split
 from .compile_environment import CompileEnvironment
 from .inductor_lowering import APIFuncLowering
 from .inductor_lowering import ReductionLowering
@@ -27,6 +38,19 @@ _duplicate_ops: tuple[object, ...] = (
     _host_tensor,
     _get_symnode,
     torch.ops.aten.sym_size.int,  # pyright: ignore[reportAttributeAccessIssue]
+)
+
+# Ops that write to memory and should be treated specially when determining
+# whether a node depends on the reduction dimension used for rolling.
+_ATOMIC_OPS: tuple[object, ...] = (
+    atomic_add,
+    atomic_and,
+    atomic_cas,
+    atomic_max,
+    atomic_min,
+    atomic_or,
+    atomic_xchg,
+    atomic_xor,
 )
 
 
@@ -97,18 +121,40 @@ class ReductionRoller:
                 return self.should_go_in_inner_graph(arg)
             return False
 
+        if node.target is hl_split:
+            base = node.args[0]
+            if isinstance(base, torch.fx.Node):
+                return self.should_go_in_inner_graph(base)
+            return False
+
+        if node.target is operator.getitem:
+            base = node.args[0]
+            if isinstance(base, torch.fx.Node) and base.target is hl_split:
+                return self.should_go_in_inner_graph(base)
+
+        if node.target is hl_join:
+            left = node.args[0]
+            right = node.args[1]
+            left_inner = isinstance(
+                left, torch.fx.Node
+            ) and self.should_go_in_inner_graph(left)
+            right_inner = isinstance(
+                right, torch.fx.Node
+            ) and self.should_go_in_inner_graph(right)
+            return left_inner or right_inner
+
         if self.is_reduction(node):
             return True
 
-        if node.target is store:
-            _, _, stored_value, _ = node.args
-            if isinstance(stored_value, torch.fx.Node):
-                val = stored_value.meta["val"]
+        if node.target is store or node.target in _ATOMIC_OPS:
+            # atomic_add(target, index, value, sem)
+            _, _, value, *_ = node.args
+            if isinstance(value, torch.fx.Node):
+                val = value.meta["val"]
             else:
-                # For non-Node values (scalars), they don't have metadata
-                val = stored_value
+                val = value
         else:
-            val = node.meta["val"]
+            val = node.meta.get("val", None)
 
         num_rdims = 0
         if isinstance(val, torch.Tensor):
@@ -156,8 +202,13 @@ class ReductionRoller:
 
         inner_nodes: dict[torch.fx.Node, torch.fx.Node] = self.inner_nodes
         outputs = {}
+        inner_node_set = set(inner_nodes)
         for orig_node, inner_node in inner_nodes.items():
-            if self.is_reduction(orig_node) and orig_node not in self.outer_nodes:
+            needs_output = orig_node not in self.outer_nodes and (
+                self.is_reduction(orig_node)
+                or any(user not in inner_node_set for user in orig_node.users)
+            )
+            if needs_output:
                 outputs[orig_node] = inner_node
             self.available.add(orig_node)
         graph = self.inner_graph
@@ -171,7 +222,7 @@ class ReductionRoller:
 
         location_meta = {
             "location": next(iter(inner_nodes)).meta["location"],
-            "stack_trace": next(iter(inner_nodes)).meta["stack_trace"],
+            "stack_trace": next(iter(inner_nodes)).meta.get("stack_trace", ""),
         }
         output_node = self.outer_graph.call_function(
             _for_loop,
@@ -266,7 +317,14 @@ class ReductionRoller:
             if node.op != "call_function":
                 return False
 
-            if node.target != torch.ops.aten.mm.default:  # pyright: ignore[reportAttributeAccessIssue]
+            # Check multiple matmul-family operations
+            if node.target not in (
+                torch.ops.aten.mm.default,  # pyright: ignore[reportAttributeAccessIssue]
+                torch.ops.aten.addmm.default,  # pyright: ignore[reportAttributeAccessIssue]
+                torch.ops.aten.bmm.default,  # pyright: ignore[reportAttributeAccessIssue]
+                torch.ops.aten.baddbmm.default,  # pyright: ignore[reportAttributeAccessIssue]
+                hl_dot,
+            ):
                 return False
 
             # Check if any inputs to matmul have rdim

@@ -68,20 +68,65 @@ runtime
 
    tile
    grid
+   static_range
    load
    store
    atomic_add
+   atomic_and
+   atomic_or
+   atomic_xor
+   atomic_xchg
+   atomic_max
+   atomic_min
+   atomic_cas
+   device_print
    signal
    wait
    stacktensor_like
    zeros
    full
    arange
+   subscript
+   split
+   join
    reduce
    associative_scan
+   cumsum
+   cumprod
+   dot
+   inline_asm_elementwise
+   inline_triton
    register_block_size
-   register_reduction_dim
    register_tunable
    constexpr
    specialize
+```
+
+### Language Classes
+
+```{eval-rst}
+.. currentmodule:: helion.language
+
+.. autosummary::
+   :toctree: generated/
+   :nosignatures:
+
+   Tile
+   StackTensor
+```
+
+### Tile Helpers
+
+```{eval-rst}
+.. currentmodule:: helion.language
+
+.. autosummary::
+   :toctree: generated/
+   :nosignatures:
+
+   tile_index
+   tile_begin
+   tile_end
+   tile_block_size
+   tile_id
 ```

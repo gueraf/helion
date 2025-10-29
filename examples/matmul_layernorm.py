@@ -1,6 +1,6 @@
 """
 Matrix Multiplication with Layer Normalization Example
-==============================================
+======================================================
 
 This example demonstrates how to implement a fused matrix multiplication and layer normalization
 operation using Helion.
@@ -9,20 +9,25 @@ operation using Helion.
 # %%
 # Imports
 # -------
+
+# %%
 from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
 
 import helion
+from helion._testing import DEVICE
 from helion._testing import run_example
 import helion.language as hl
 
-
 # %%
 # MatMul-LayerNorm Kernel
-# --------------------
+# -----------------------
 # static_shapes=True gives a performance boost for matmuls
+
+
+# %%
 @helion.kernel(static_shapes=True)
 def matmul_layernorm(
     x: torch.Tensor, y: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor
@@ -41,7 +46,7 @@ def matmul_layernorm(
     """
     m, k = x.size()
     k2 = y.size(0)
-    n = hl.register_reduction_dim(y.size(1))
+    n = hl.specialize(y.size(1))
     assert k == k2, f"size mismatch {k} != {k2}"
     assert weight.size(0) == n, f"weight size mismatch {weight.size(0)} != {n}"
     assert bias.size(0) == n, f"bias size mismatch {bias.size(0)} != {n}"
@@ -54,8 +59,11 @@ def matmul_layernorm(
             mm = torch.matmul(x[tile_m, tile_k], y[tile_k, :])
             acc = acc + mm
         eps = 1e-5
-        var, mean = torch.var_mean(acc, dim=-1, keepdim=True, correction=0)
-        normalized = (acc - mean) * torch.rsqrt(var + eps)
+        sum_vals = acc.sum(dim=-1, keepdim=True)
+        mean = sum_vals / n
+        centered = acc - mean
+        var = (centered * centered).sum(dim=-1, keepdim=True) / n
+        normalized = centered * torch.rsqrt(var + eps)
         acc = normalized * (weight[:].to(torch.float32)) + (bias[:].to(torch.float32))
         out[tile_m, :] = acc
     return out
@@ -63,7 +71,10 @@ def matmul_layernorm(
 
 # %%
 # Reference Implementation
-# --------------------
+# ------------------------
+
+
+# %%
 def matmul_layernorm_pytorch(
     x: torch.Tensor, y: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor
 ) -> torch.Tensor:
@@ -93,7 +104,10 @@ def matmul_layernorm_pytorch(
 
 # %%
 # Verification Function
-# -------------------
+# ---------------------
+
+
+# %%
 def check(m: int, k: int, n: int) -> None:
     """
     Verify the matmul_layernorm kernel implementation against the PyTorch reference implementation.
@@ -103,16 +117,19 @@ def check(m: int, k: int, n: int) -> None:
         k: Second dimension of the first matrix / First dimension of the second matrix
         n: Second dimension of the second matrix
     """
-    x = torch.randn([m, k], device="cuda", dtype=torch.float16)
-    y = torch.randn([k, n], device="cuda", dtype=torch.float16)
-    weight = torch.randn([n], device="cuda", dtype=torch.float16)
-    bias = torch.randn([n], device="cuda", dtype=torch.float16)
+    x = torch.randn([m, k], device=DEVICE, dtype=torch.float16)
+    y = torch.randn([k, n], device=DEVICE, dtype=torch.float16)
+    weight = torch.randn([n], device=DEVICE, dtype=torch.float16)
+    bias = torch.randn([n], device=DEVICE, dtype=torch.float16)
     run_example(matmul_layernorm, matmul_layernorm_pytorch, (x, y, weight, bias))
 
 
 # %%
 # Main Function
-# -----------
+# -------------
+
+
+# %%
 def main() -> None:
     """
     Main entry point that runs the matmul_layernorm kernel verification with different matrix sizes.

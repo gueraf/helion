@@ -12,6 +12,7 @@ from typing import Protocol
 
 import sympy
 import torch
+from torch._dynamo.source import EphemeralSource
 from torch._dynamo.source import LocalSource
 from torch._inductor.runtime.runtime_utils import next_power_of_2
 from torch._inductor.utils import triton_type
@@ -21,6 +22,8 @@ from torch.fx.experimental.symbolic_shapes import ShapeEnv
 from .. import exc
 from ..language.constexpr import ConstExpr
 from .loop_dependency_checker import LoopDependencyChecker
+from .source_location import SourceLocation
+from .source_location import current_location
 from .variable_origin import BlockSizeOrigin
 from .variable_origin import Origin
 
@@ -39,6 +42,27 @@ if TYPE_CHECKING:
 
 
 tls: _TLS = typing.cast("_TLS", threading.local())
+
+
+class HelionKernelSource(EphemeralSource):
+    """Ephemeral source that formats as a kernel file location."""
+
+    def __init__(self, location: SourceLocation) -> None:
+        super().__init__(desc=None)
+        self.location = location
+
+    def name(self) -> str:  # type: ignore[override]
+        formatted = self.location.format().rstrip("\n")
+        if not formatted:
+            return ""
+        return "\nHelion kernel stack:\n" + formatted
+
+
+def _current_symbol_source() -> EphemeralSource | None:
+    location = current_location()
+    if not location:
+        return None
+    return HelionKernelSource(location)
 
 
 class CompileEnvironment:
@@ -72,6 +96,9 @@ class CompileEnvironment:
         self.specialized_vars: set[sympy.Symbol] = set()
         self.loop_dependency_checker = LoopDependencyChecker()
         self._symint_cache: dict[object, torch.SymInt] = {}
+        self.device_load_count = (
+            0  # Track number of loads in all device code for eviction policy tuning
+        )
 
     def add_kernel_tensor_size(self, sizes: Sequence[int | torch.SymInt]) -> None:
         from .device_function import contains_only_block_size_symbols
@@ -92,7 +119,30 @@ class CompileEnvironment:
 
         for shape in self.kernel_tensor_sizes:
             FlattenedTileStrategy.update_allow_flattened(shape)
+        self._disable_range_num_stages_for_aliasing()
         self.config_spec._remove_duplicates()
+
+    def _disable_range_num_stages_for_aliasing(self) -> None:
+        """
+        Disable range_num_stages choices if any kernel argument name is both read and written.
+
+        Workaround for https://github.com/triton-lang/triton/issues/8259
+        """
+
+        if not self.config_spec.range_num_stages:
+            return
+
+        from .ast_read_writes import ReadWrites
+        from .host_function import HostFunction
+
+        host_fn = HostFunction.current()
+        rw = ReadWrites.from_list(host_fn.body)
+        if not (rw.reads and rw.writes):
+            return
+
+        arg_names = set(host_fn.params.arguments.keys())
+        if set(rw.reads) & set(rw.writes) & arg_names:
+            self.config_spec.range_num_stages.clear()
 
     def allocate_block_size(
         self,
@@ -154,8 +204,9 @@ class CompileEnvironment:
         return self.block_sizes[rdim_idx]
 
     def create_block_var(self, debug_name: str, hint: int = 64) -> torch.SymInt:
+        source = _current_symbol_source()
         with self.shape_env.ignore_fresh_unbacked_symbols():
-            sym = self.shape_env.create_unbacked_symint()
+            sym = self.shape_env.create_unbacked_symint(source=source)
             # self.shape_env.guards.append(
             #     ShapeGuard(
             #         sympy.Ne(sym._sympy_(), 0),
@@ -172,8 +223,9 @@ class CompileEnvironment:
         return sym
 
     def create_unbacked_symint(self, hint: int = 8192) -> torch.SymInt:
+        source = _current_symbol_source()
         with self.shape_env.ignore_fresh_unbacked_symbols():
-            sym = self.shape_env.create_unbacked_symint()
+            sym = self.shape_env.create_unbacked_symint(source=source)
             # TODO(jansel): this is a hack to get us past some == 1 checks
             #               we should probably have a better way to handle this
             self.shape_env.var_to_val[sym._sympy_()] = sympy.sympify(hint)
@@ -204,6 +256,8 @@ class CompileEnvironment:
         return result
 
     def to_fake(self, obj: object, origin: Origin) -> object:
+        if obj is None:
+            return None
         if isinstance(obj, torch.Tensor):
             return self._to_fake_tensor(obj, origin.to_source())
         if isinstance(obj, (bool, int, float)):
@@ -362,7 +416,7 @@ class CompileEnvironment:
         except NoCurrentEnvironment:
             return False
 
-    def get_block_id(self, size: int | torch.SymInt | sympy.Expr) -> int | None:
+    def get_block_id(self, size: int | torch.SymInt | sympy.Basic) -> int | None:
         """
         Get the block ID associated with a given size expression.
 
@@ -371,7 +425,7 @@ class CompileEnvironment:
         symbolic expressions to find their associated block IDs.
 
         Args:
-            size: The size expression to check. Can be an integer, torch.SymInt, or sympy.Expr.
+            size: The size expression to check. Can be an integer, torch.SymInt, or sympy.Basic.
 
         Returns:
             The block ID if the size corresponds to a registered block size, None otherwise.
@@ -387,6 +441,37 @@ class CompileEnvironment:
                 BlockSizeOrigin,
             ):
                 return origin_info.origin.block_id
+        return None
+
+    def resolve_block_id(self, size: object) -> int | None:
+        """Best-effort lookup of a block id for ``size``.
+
+        Falls back to matching constant reduction dimensions if ``get_block_id``
+        cannot resolve the identifier directly.
+        """
+
+        if isinstance(size, (int, torch.SymInt, sympy.Expr)):
+            block_id = self.get_block_id(size)
+            if block_id is not None:
+                return block_id
+        else:
+            block_id = None
+
+        if isinstance(size, torch.SymInt):
+            expr: sympy.Expr | None = size._sympy_()
+        elif isinstance(size, int):
+            expr = sympy.Integer(size)
+        elif isinstance(size, sympy.Expr):
+            expr = sympy.simplify(size)
+        else:
+            expr = None
+
+        if expr is None or getattr(expr, "free_symbols", None):
+            return None
+
+        for info in reversed(self.block_sizes):
+            if info.reduction and info.size_matches(expr):
+                return info.block_id
         return None
 
 
@@ -410,6 +495,12 @@ class BlockSizeInfo:
     var: torch.SymInt
     reduction: bool
     block_size_source: BlockSizeSource
+    debug_names: set[str] = dataclasses.field(default_factory=set)
+
+    def add_debug_name(self, name: str) -> None:
+        if not name:
+            return
+        self.debug_names.add(name)
 
     @property
     def numel(self) -> sympy.Expr:
@@ -440,11 +531,14 @@ class BlockSizeInfo:
             self.size = size
             if size is not None:
                 env = CompileEnvironment.current()
+                # Refresh the var_to_val hint to match the resolved block size
+                hint = env.size_hint(size)
+                env.shape_env.var_to_val[self.symbol()] = sympy.Integer(hint)
                 with contextlib.suppress(KeyError):
                     # update the size hint now that we know the size
                     env.config_spec.block_sizes.block_id_lookup(
                         self.block_id
-                    ).update_hint(env.size_hint(size))
+                    ).update_hint(hint)
         elif size is None or self.size is None or self.size != size:
             self.size = None
 
@@ -494,9 +588,11 @@ class FixedBlockSizeSource(BlockSizeSource):
 @dataclasses.dataclass
 class LoopSpecBlockSizeSource(BlockSizeSource):
     def from_config(self, config: Config, block_size_info: BlockSizeInfo) -> int:
-        index = CompileEnvironment.current().config_spec.block_sizes.block_id_to_index(
-            block_size_info.block_id
-        )
+        env = CompileEnvironment.current()
+        size = block_size_info.size
+        if isinstance(size, (int, torch.SymInt)) and env.known_equal(size, 1):
+            return 1
+        index = env.config_spec.block_sizes.block_id_to_index(block_size_info.block_id)
         return config.block_sizes[index]
 
 
@@ -535,3 +631,17 @@ def _to_sympy(x: int | torch.SymInt) -> sympy.Expr:
 
 def _has_unbacked(expr: sympy.Expr) -> bool:
     return any(n.name.startswith("u") for n in expr.free_symbols)  # pyright: ignore[reportAttributeAccessIssue]
+
+
+def format_shape(shape: tuple[object, ...]) -> str:
+    def _format_dim(dim: object) -> str:
+        if isinstance(dim, torch.SymInt):
+            env = CompileEnvironment.current()
+            block_id = env.get_block_id(dim)
+            if block_id is not None and (
+                names := sorted(env.block_sizes[block_id].debug_names)
+            ):
+                return f"{' or '.join(names)} (symbol: {dim})"
+        return str(dim)
+
+    return "(" + ", ".join(_format_dim(d) for d in shape) + ")"

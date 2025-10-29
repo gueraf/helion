@@ -1,0 +1,236 @@
+name: Benchmark
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        required: true
+        type: string
+      python-version:
+        required: true
+        type: string
+      image:
+        required: true
+        type: string
+      runtime-version:
+        required: true
+        type: string
+      container-options:
+        required: true
+        type: string
+      alias:
+        required: true
+        type: string
+      kernels:
+        required: true
+        type: string
+      env-vars:
+        required: false
+        type: string
+        default: ""
+      custom-args:
+        required: false
+        type: string
+        default: ""
+
+jobs:
+  benchmark:
+    name: benchmark-${{ inputs.runtime-version }}-${{ inputs.kernels }}-py${{ inputs.python-version }}-${{ inputs.alias }}
+
+    env:
+      HELION_AUTOTUNE_LOG_LEVEL: DEBUG
+
+    container:
+      image: ${{ inputs.image }}
+      options: ${{ inputs.container-options }}
+
+    runs-on: ${{ inputs.runner }}
+    permissions:
+      id-token: write
+      contents: read
+
+    defaults:
+      run:
+        shell: bash -l {0}
+
+    outputs:
+      benchmark-metadata: ${{ steps.gather-benchmark-metadata.outputs.benchmark-metadata }}
+      runners-info: ${{ steps.gather-runners-info.outputs.runners-info }}
+      dependencies: ${{ steps.gather-dependencies.outputs.dependencies }}
+
+    steps:
+      - name: Run NVIDIA command
+        if: startsWith(inputs.image, 'nvidia')
+        run: |
+          echo "Detected NVIDIA image"
+          nvidia-smi || echo "nvidia-smi not found"
+
+      - name: Run ROCm command
+        if: startsWith(inputs.image, 'rocm')
+        run: |
+          echo "Detected ROCm image"
+          rocminfo || echo "rocminfo not found"
+
+      - name: Setup toolchain
+        run: |
+          set -x
+          apt-get update
+          apt-get install -y git
+
+      - name: Check out code
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Create virtual environment
+        run: |
+          uv venv --python ${{ inputs.python-version }}
+
+      - name: Install PyTorch
+        run: |
+          source .venv/bin/activate
+          uv pip install -U "torch==2.9.*" --index-url https://download.pytorch.org/whl/${{ inputs.runtime-version }}
+
+      - name: Install Helion
+        run: |
+          source .venv/bin/activate
+          uv pip install -r requirements.txt
+          SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0" uv pip install -e .'[dev]' --no-deps
+          python -c "import helion; print(helion.__name__)"
+
+      - name: Install Benchmark Requirements
+        run: |
+          set -x
+          source .venv/bin/activate
+          uv pip install pip
+          uv pip install quack-kernels --no-deps
+          mkdir -p benchmarks/ && pushd benchmarks/
+          git clone https://github.com/pytorch-labs/tritonbench/
+          pushd tritonbench/
+          git submodule update --init --recursive
+          uv pip install -r requirements.txt
+          python install.py --liger
+          uv pip install -e . --no-deps
+          popd
+          popd
+
+      - name: Run Benchmark
+        run: |
+          rm -rf /tmp/torchinductor_*/ || true
+
+          source .venv/bin/activate
+
+          TEST_REPORTS_DIR=$(pwd)/test/test-reports
+          mkdir -p "$TEST_REPORTS_DIR"
+          echo "$TEST_REPORTS_DIR"
+
+          KERNEL_LIST="${{ inputs.kernels }}"
+          for kernel in ${KERNEL_LIST//,/ }; do
+            echo "=========================================="
+            echo "Running benchmark for kernel: $kernel"
+            echo "=========================================="
+
+            # Get available implementations and baseline for this kernel
+            KERNEL_INFO=$(python benchmarks/run.py --list-impls-for-benchmark-ci --op $kernel | grep "^$kernel:")
+            IMPLS=$(echo "$KERNEL_INFO" | sed -n 's/.*impls=\([^ ]*\).*/\1/p')
+            BASELINE=$(echo "$KERNEL_INFO" | sed -n 's/.*baseline=\([^ ]*\).*/\1/p')
+
+            if [[ -z "$IMPLS" ]]; then
+              echo "Warning: No implementations found for kernel $kernel, skipping..."
+              continue
+            fi
+            if [[ -z "$BASELINE" ]]; then
+              echo "Warning: No baseline found for kernel $kernel, skipping..."
+              continue
+            fi
+            echo "Using baseline: $BASELINE"
+            echo "Available implementations for $kernel: $IMPLS"
+
+            # Do autotuning but do not record the results
+            ${{ inputs.env-vars }} python benchmarks/run.py \
+                --op $kernel \
+                --metrics speedup,accuracy \
+                --latency-measure-mode triton_do_bench \
+                --cudagraph \
+                --only $IMPLS \
+                --only-match-mode prefix-with-baseline \
+                --baseline $BASELINE \
+                --atol 1e-2 \
+                --rtol 1e-2 \
+                --input-sample-mode equally-spaced-k \
+                --keep-going \
+                ${{ inputs.custom-args }}
+
+            # Relax the GPU
+            sleep 2m
+
+            # Run again with cache and record results
+            ${{ inputs.env-vars }} HELION_ASSERT_CACHE_HIT=1 python benchmarks/run.py \
+                --op $kernel \
+                --metrics speedup,accuracy \
+                --latency-measure-mode triton_do_bench \
+                --cudagraph \
+                --only $IMPLS \
+                --only-match-mode prefix-with-baseline \
+                --baseline $BASELINE \
+                --atol 1e-2 \
+                --rtol 1e-2 \
+                --input-sample-mode equally-spaced-k \
+                --output "$TEST_REPORTS_DIR/helionbench.json" \
+                --append-to-output \
+                --keep-going \
+                ${{ inputs.custom-args }}
+
+            echo "✅ Completed benchmark for kernel: $kernel"
+          done
+
+          if [[ ! -s "$TEST_REPORTS_DIR/helionbench.json" ]]; then
+            echo "❌ helionbench.json is missing or empty"
+            exit 1
+          fi
+          cat "$TEST_REPORTS_DIR/helionbench.json"
+
+      - name: Gather benchmark metadata
+        id: gather-benchmark-metadata
+        uses: pytorch/test-infra/.github/actions/gather-benchmark-metadata@main
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          venv: .venv/bin/activate
+
+      - name: Gather runners info
+        id: gather-runners-info
+        uses: pytorch/test-infra/.github/actions/gather-runners-info@main
+        with:
+          venv: .venv/bin/activate
+
+      - name: Gather dependencies
+        id: gather-dependencies
+        uses: pytorch/test-infra/.github/actions/gather-dependencies@main
+        with:
+          venv: .venv/bin/activate
+
+      - name: Upload the benchmark results to GitHub
+        uses: actions/upload-artifact@v5
+        with:
+          name: benchmark-results-${{ inputs.alias }}-${{ inputs.kernels }}
+          path: test/test-reports
+
+  upload-benchmark-results:
+    needs: benchmark
+    uses: pytorch/test-infra/.github/workflows/upload_benchmark_results.yml@main
+    permissions:
+      id-token: write
+      contents: read
+    with:
+      benchmark-artifact: benchmark-results-${{ inputs.alias }}-${{ inputs.kernels }}
+      benchmark-metadata: ${{ needs.benchmark.outputs.benchmark-metadata }}
+      runners-info: ${{ needs.benchmark.outputs.runners-info }}
+      dependencies: ${{ needs.benchmark.outputs.dependencies }}
+      schema-version: v3
+      dry-run: false

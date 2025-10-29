@@ -1,6 +1,6 @@
 """
 One-Shot All-Reduce Example
-========================================
+===========================
 This example demonstrates how to implement a one-shot pulling all-reduce operation
 using Helion and PyTorch's distributed capabilities. It includes a Helion kernel
 demonstrating how to do cross-device synchronization using symmetric memory signal pads
@@ -10,6 +10,8 @@ and access symmetric memory tensor resident on peer devices.
 # %%
 # Imports
 # -------
+
+# %%
 from __future__ import annotations
 
 import os
@@ -20,10 +22,14 @@ import torch.distributed._symmetric_memory as symm_mem
 from torch.utils.cpp_extension import load_inline
 
 import helion
+from helion._testing import DEVICE
+from helion._testing import run_example
 import helion.language as hl
 
 # %%
 # Work around before symm mem natively supports extract dev_ptrs as tensors: from_blob
+
+# %%
 from_blob_cpp = """
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -72,7 +78,10 @@ def dev_array_to_tensor_short(
 
 # %%
 # One Shot All-Reduce Kernel Implementation
-# ----------------------------------------
+# -----------------------------------------
+
+
+# %%
 @helion.jit(
     config=helion.Config(
         block_sizes=[8192],
@@ -159,7 +168,10 @@ def one_shot_all_reduce_kernel(
 
 # %%
 # Attract tensors from symmetric memory handler
-# ----------------------------------------
+# ---------------------------------------------
+
+
+# %%
 def helion_one_shot_all_reduce(a_shared: torch.Tensor) -> torch.Tensor:
     """
     Prepares symmetric memory tensors for Helion one-shot all-reduce kernel.
@@ -201,9 +213,33 @@ def helion_one_shot_all_reduce(a_shared: torch.Tensor) -> torch.Tensor:
     )
 
 
+def reference_one_shot_all_reduce(a_shared: torch.Tensor) -> torch.Tensor:
+    """
+    Reference implementation using the symmetric memory one-shot primitive.
+    """
+    dist_group = dist.group.WORLD
+    if dist_group is None:
+        raise RuntimeError("No distributed group available")
+
+    a_shared_clone = symm_mem.empty(
+        a_shared.shape,
+        dtype=a_shared.dtype,
+        device=a_shared.device,
+    )
+    symm_mem.rendezvous(a_shared_clone, dist_group.group_name)
+    a_shared_clone.copy_(a_shared)
+
+    return torch.ops.symm_mem.one_shot_all_reduce(  # pyright: ignore[reportCallIssue]
+        a_shared_clone, "sum", dist_group.group_name
+    )
+
+
 # %%
 # Testing Function
-# ----------------------------------------
+# ----------------
+
+
+# %%
 def test(N: int, device: torch.device, dtype: torch.dtype) -> None:
     """
     Test the Helion all-reduce implementation against PyTorch's reference implementation.
@@ -218,21 +254,13 @@ def test(N: int, device: torch.device, dtype: torch.dtype) -> None:
     world_size = dist.get_world_size()
     a_shared = symm_mem.empty(N // world_size, dtype=dtype, device=device).normal_()
 
-    a_shared_clone = symm_mem.empty(
-        a_shared.shape,
-        dtype=a_shared.dtype,
-        device=a_shared.device,
+    run_example(
+        helion_one_shot_all_reduce,
+        reference_one_shot_all_reduce,
+        (a_shared,),
+        rtol=1e-1,
+        atol=1e-1,
     )
-    symm_mem.rendezvous(a_shared_clone, dist_group.group_name)
-    a_shared_clone.copy_(a_shared)
-
-    a_out = helion_one_shot_all_reduce(a_shared)
-
-    gloden_o = torch.ops.symm_mem.one_shot_all_reduce(
-        a_shared_clone, "sum", dist_group.group_name
-    )
-
-    torch.testing.assert_close(a_out, gloden_o, rtol=1e-1, atol=1e-1)
 
 
 def main() -> None:
@@ -260,4 +288,6 @@ if __name__ == "__main__":
     --rdzv-backend c10d --rdzv-endpoint localhost:0 \
     --no_python python3 examples/all_reduce.py
     """
+    # TODO(adam-smnk): generalize to XPU
+    assert DEVICE.type == "cuda", "Requires CUDA device"
     main()

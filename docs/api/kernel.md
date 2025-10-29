@@ -47,7 +47,7 @@ c = vector_add(a, b)  # Automatically compiles and executes
 
 ```python
 @helion.kernel(
-    use_default_config=True,    # Skip autotuning
+    autotune_effort="none",    # Skip autotuning
     print_output_code=True      # Debug generated code
 )
 def my_kernel(x: torch.Tensor) -> torch.Tensor:
@@ -86,6 +86,10 @@ def shape_specialized_kernel(x: torch.Tensor) -> torch.Tensor:
 
 bound_static = shape_specialized_kernel.bind((torch.randn(100, 50),))
 result = bound_static(torch.randn(100, 50))  # Must be exactly [100, 50]
+```
+
+```{warning}
+Helion shape-specializes kernels by default (`static_shapes=True`) for the best performance. Bound kernels and caches require tensors with the exact same shapes and strides as the examples you compile against. Set `static_shapes=False` if you need the same compiled kernel to serve many shapes.
 ```
 
 ### BoundKernel Methods
@@ -131,9 +135,9 @@ print(triton_code)
 Kernels are automatically cached based on:
 
 - **Argument types** (dtype, device)
-- **Tensor shapes** (when using `static_shapes=True`)
+- **Tensor shapes** (default: `static_shapes=True`)
 
-By default (`static_shapes=False`), kernels only specialize on basic shape categories (0, 1, or ≥2 per dimension) rather than exact shapes, allowing the same compiled kernel to handle different tensor sizes efficiently.
+By default (`static_shapes=True`), Helion treats shapes and strides as compile-time constants, baking them into generated Triton code for the best performance. To reuse a single compiled kernel across size variations, set `static_shapes=False`, which instead buckets each dimension as `{0, 1, ≥2}` and allows more inputs to share the same cache entry.
 
 ```python
 # These create separate cache entries
@@ -154,7 +158,8 @@ Settings control **how the kernel is compiled** and the development environment:
 ```python
 @helion.kernel(
     # Settings parameters
-    use_default_config=True,      # Skip autotuning for development
+    autotune_effort="none",      # Skip autotuning for development
+    autotune_effort="quick",     # Smaller autotuning budget when search is enabled
     print_output_code=True,       # Debug: show generated Triton code
     static_shapes=True,           # Compilation optimization strategy
     autotune_log_level=logging.DEBUG  # Verbose autotuning output

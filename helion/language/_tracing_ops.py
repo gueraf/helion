@@ -7,6 +7,7 @@ from typing import TypeVar
 import sympy
 import torch
 from torch._inductor.codegen.simd import constant_repr
+from torch._inductor.utils import triton_type
 from torch.fx import has_side_effect
 from torch.fx.experimental.sym_node import SymNode
 
@@ -53,8 +54,10 @@ def _(state: CodegenState) -> ast.AST:
         if block_size_var is None:
             return expr_from_string("1")
         return expr_from_string(block_size_var)
-    return state.codegen.lift(
-        expr_from_string(state.sympy_expr(val._sympy_())),
+    sym_expr = val._sympy_()
+    return state.codegen.lift_symnode(
+        expr_from_string(state.sympy_expr(sym_expr)),
+        sym_expr,
         dce=True,
         prefix="symnode",
     )
@@ -162,7 +165,9 @@ def _and(left: object, right: object) -> object:
 
 @_decorators.codegen(_and)
 def _(state: CodegenState) -> None:
-    return expr_from_string("lhs and rhs", lhs=state.ast_arg(0), rhs=state.ast_arg(1))  # pyright: ignore[reportReturnType]
+    return expr_from_string(
+        "{lhs} and {rhs}", lhs=state.ast_arg(0), rhs=state.ast_arg(1)
+    )  # pyright: ignore[reportReturnType]
 
 
 @_decorators.register_fake(_and)
@@ -213,7 +218,9 @@ def _(left: object, right: object) -> object:
 
 @_decorators.codegen(_or)
 def _(state: CodegenState) -> None:
-    return expr_from_string("lhs or rhs", lhs=state.ast_arg(0), rhs=state.ast_arg(1))  # pyright: ignore[reportReturnType]
+    return expr_from_string(
+        "{lhs} or {rhs}", lhs=state.ast_arg(0), rhs=state.ast_arg(1)
+    )  # pyright: ignore[reportReturnType]
 
 
 @_decorators.api()
@@ -237,7 +244,7 @@ def _(left: object) -> object:
 @_decorators.codegen(_not)
 def _(state: CodegenState) -> ast.AST:
     return expr_from_string(
-        "not lhs",
+        "not {lhs}",
         lhs=state.ast_arg(0),
     )
 
@@ -274,9 +281,9 @@ def _(state: CodegenState) -> ast.AST:
     mask_exprs = []
     input_sizes = [*tensor.size()]
     for dim, size in enumerate(input_sizes):
-        if (index := CompileEnvironment.current().get_block_id(size)) is not None and (
-            mask_var := state.codegen.mask_var(index)
-        ) is not None:
+        if (
+            index := CompileEnvironment.current().resolve_block_id(size)
+        ) is not None and (mask_var := state.codegen.mask_var(index)) is not None:
             expand = state.tile_strategy.expand_str(input_sizes, dim)
             mask_exprs.append(f"({mask_var}{expand})")
     if not mask_exprs:
@@ -284,8 +291,15 @@ def _(state: CodegenState) -> ast.AST:
     mask_expr = "&".join(mask_exprs)
     if len(mask_exprs) < len(input_sizes):
         mask_expr = f"tl.broadcast_to({mask_expr}, {state.tile_strategy.shape_str(input_sizes)})"
+    # Ensure the masked value literal matches the tensor dtype to avoid unintended upcasts
+    input_dtype = tensor.dtype
+    other_typed = expr_from_string(
+        f"tl.full([], {constant_repr(other)}, {triton_type(input_dtype)})"
+    )
     return expr_from_string(
-        f"tl.where({mask_expr}, expr, {constant_repr(other)})", expr=state.ast_arg(0)
+        f"tl.where({mask_expr}, {{expr}}, {{other}})",
+        expr=state.ast_arg(0),
+        other=other_typed,
     )
 
 
@@ -327,7 +341,7 @@ def _(state: CodegenState) -> ast.AST:
     varname = state.codegen.tmpvar(
         prefix=value.id if isinstance(value, ast.Name) else "new_var"
     )
-    state.add_statement(statement_from_string(f"{varname} = expr", expr=value))
+    state.add_statement(statement_from_string(f"{varname} = {{expr}}", expr=value))
     return create(ast.Name, id=varname, ctx=ast.Load())
 
 

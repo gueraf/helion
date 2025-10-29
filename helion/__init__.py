@@ -3,6 +3,7 @@ from __future__ import annotations
 from triton import cdiv
 from triton import next_power_of_2
 
+from . import _compat as _compat_module  # noqa: F401  # side-effect import
 from . import _logging
 from . import exc
 from . import language
@@ -13,7 +14,6 @@ from .runtime import kernel
 from .runtime import kernel as jit  # alias
 from .runtime.settings import RefMode
 from .runtime.settings import Settings
-from .runtime.settings import set_default_settings
 
 __all__ = [
     "Config",
@@ -27,7 +27,6 @@ __all__ = [
     "language",
     "next_power_of_2",
     "runtime",
-    "set_default_settings",
 ]
 
 _logging.init_logs()

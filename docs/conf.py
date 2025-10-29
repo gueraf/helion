@@ -9,6 +9,8 @@ import sys
 from typing import Callable
 from typing import Protocol
 
+import pytorch_sphinx_theme2  # pyright: ignore[reportMissingImports]
+
 # -- Path setup --------------------------------------------------------------
 
 
@@ -22,7 +24,7 @@ class SphinxApp(Protocol):
 
 # If extensions (or modules to document with autodoc) are in another directory,
 # add these directories to sys.path here.
-sys.path.insert(0, os.path.abspath(".."))
+sys.path.insert(0, os.path.abspath("."))
 
 # -- Project information -----------------------------------------------------
 
@@ -39,6 +41,11 @@ extensions = [
     "myst_parser",
     "sphinx_autodoc_typehints",
     "sphinx_gallery.gen_gallery",
+    "sphinx_design",
+    "sphinx_sitemap",
+    "sphinxcontrib.mermaid",
+    "pytorch_sphinx_theme2",
+    "sphinxext.opengraph",
 ]
 
 # MyST parser configuration
@@ -81,11 +88,107 @@ source_suffix = {
 
 # -- Options for HTML output -------------------------------------------------
 
-html_theme = "sphinx_rtd_theme"
+html_theme = "pytorch_sphinx_theme2"
+html_theme_path = [pytorch_sphinx_theme2.get_html_theme_path()]
+
+html_theme_options = {
+    "navigation_with_keys": False,
+    "analytics_id": "GTM-NPLPKN5G",
+    "canonical_url": "https://helionlang.com/",
+    "show_lf_header": False,
+    "show_lf_footer": False,
+    "logo": {
+        "text": "",
+        "image_light": "_static/helion_nobackground.png",
+        "image_dark": "_static/helion_nobackground.png",
+    },
+    "icon_links": [
+        {
+            "name": "X",
+            "url": "https://x.com/PyTorch",
+            "icon": "fa-brands fa-x-twitter",
+        },
+        {
+            "name": "GitHub",
+            "url": "https://github.com/pytorch/helion",
+            "icon": "fa-brands fa-github",
+        },
+        {
+            "name": "Discourse",
+            "url": "https://dev-discuss.pytorch.org/",
+            "icon": "fa-brands fa-discourse",
+        },
+        {
+            "name": "PyPi",
+            "url": "https://pypi.org/project/helion",
+            "icon": "fa-brands fa-python",
+        },
+    ],
+    "use_edit_page_button": True,
+    "navbar_center": "navbar-nav",
+}
+
+html_favicon = "_static/helion_nobackground.png"
+
+theme_variables = pytorch_sphinx_theme2.get_theme_variables()
+templates_path = ["_templates"]
+if pytorch_sphinx_theme2.__file__ is not None:
+    templates_path.append(
+        os.path.join(os.path.dirname(pytorch_sphinx_theme2.__file__), "templates")
+    )
+
+html_context = {
+    "theme_variables": theme_variables,
+    "display_github": True,
+    "github_url": "https://github.com",
+    "github_user": "pytorch",
+    "github_repo": "helion",
+    "feedback_url": "https://github.com/pytorch/helion",
+    "github_version": "main",
+    "doc_path": "docs/",
+    "library_links": [
+        {
+            "name": "Helion",
+            "url": "https://pytorch.github.io/helion/",
+            "current": True,
+        },
+        {
+            "name": "torch.compiler",
+            "url": "https://pytorch.org/docs/stable/torch.compiler.html",
+        },
+        {
+            "name": "PyTorch",
+            "url": "https://pytorch.org/docs/stable/",
+        },
+        {
+            "name": "Triton",
+            "url": "https://triton-lang.org/main/",
+        },
+    ],
+}
+
+html_sidebars = {
+    "helion_puzzles": [],
+    "examples/index": [],
+    "installation": [],
+}
+
 html_static_path = ["_static"]
+
+html_js_files = ["js/runllm-widget.js"]
 
 # Output directory for HTML files
 html_output_dir = "../site"
+
+sitemap_locales = [None]
+sitemap_excludes = [
+    "search.html",
+    "genindex.html",
+]
+sitemap_url_scheme = "{link}"
+
+# Base URL for sitemap and canonical links
+html_baseurl = "https://helionlang.com/"
 
 # -- Options for autodoc extension ------------------------------------------
 

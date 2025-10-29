@@ -5,8 +5,11 @@ This example demonstrates a Helion kernel for matrix multiplication that uses a 
 strategy to improve parallelism and performance. It supports an optional epilogue function
 for post-processing the accumulator, such as adding bias.
 The example includes:
+
 - The Helion kernel implementation with static shapes for performance.
+
 - A check function to validate correctness against PyTorch baselines.
+
 - A wrapper for integration with tritonbench.
 """
 
@@ -18,6 +21,7 @@ from typing import TYPE_CHECKING
 import torch
 
 import helion
+from helion._testing import DEVICE
 from helion._testing import run_example
 from helion.autotuner import PowerOfTwoFragment
 import helion.language as hl
@@ -80,14 +84,14 @@ def check(m: int, k: int, n: int) -> None:
         k (int): Shared dimension.
         n (int): Number of columns in the right input matrix.
     """
-    x = torch.randn([m, k], device="cuda", dtype=torch.float16)
-    y = torch.randn([k, n], device="cuda", dtype=torch.float16)
+    x = torch.randn([m, k], device=DEVICE, dtype=torch.float16)
+    y = torch.randn([k, n], device=DEVICE, dtype=torch.float16)
     # Test without bias
     kernel_no_bias = lambda x, y: matmul_split_k(x, y)  # noqa: E731
     expected_no_bias = lambda x, y: torch.matmul(x, y)  # noqa: E731
     run_example(kernel_no_bias, expected_no_bias, (x, y), atol=1)
     # Test with bias using closure approach
-    bias = torch.randn([n], device="cuda", dtype=torch.float16)
+    bias = torch.randn([n], device=DEVICE, dtype=torch.float16)
     kernel_with_bias = lambda x, y: matmul_split_k(  # noqa: E731
         x, y, epilogue=lambda acc, tile: acc + bias[tile[1]]
     )
@@ -97,11 +101,12 @@ def check(m: int, k: int, n: int) -> None:
 
 # %%
 def matmul_split_k_tritonbench(
-    a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None
+    tb_op: object, a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None
 ) -> Callable:
     """
     Wrapper for tritonbench that matches its interface.
     Args:
+        tb_op: TritonBench operator instance
         a (torch.Tensor): Left input matrix.
         b (torch.Tensor): Right input matrix.
         bias (torch.Tensor or None): Optional bias to add in the epilogue.

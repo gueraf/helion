@@ -45,6 +45,8 @@ from .inductor_lowering import APIFuncLowering
 from .inductor_lowering import CodegenState
 from .inductor_lowering import codegen_call_with_graph
 from .inductor_lowering import prepare_graph_lowerings
+from .matmul_utils import tensor_matmul_replacement
+from .matmul_utils import torch_matmul_replacement
 from .node_masking import remove_unnecessary_masking
 from .roll_reduction import ReductionRoller
 from .source_location import current_location
@@ -71,6 +73,15 @@ if TYPE_CHECKING:
 
 
 tls: _TLS = cast("_TLS", threading.local())
+
+
+def _get_custom_decomp_table() -> dict[torch._ops.OpOverload, Callable[..., object]]:
+    decomp_table = select_decomp_table().copy()
+    # Normally, aten.stack is decomposed to aten.unsqueeze + aten.cat, but it's difficult to
+    # figure out the right Triton implementation for aten.cat. As a workaround, we disable
+    # the decomp for aten.stack and implement aten.stack in Triton (codegen_stack) instead.
+    decomp_table.pop(torch.ops.aten.stack.default, None)
+    return decomp_table
 
 
 def _make_fx(fn: Callable[..., object], *args: object) -> torch.fx.Graph:
@@ -126,6 +137,12 @@ def _make_fx(fn: Callable[..., object], *args: object) -> torch.fx.Graph:
             torch.fx.proxy,  # pyright: ignore[reportAttributeAccessIssue]
             "_COPY_META_FIELDS",
             [*torch.fx.proxy._COPY_META_FIELDS, "location"],  # pyright: ignore[reportAttributeAccessIssue]
+        ),
+        patch.object(torch, "matmul", torch_matmul_replacement),
+        patch.object(
+            torch.Tensor,
+            "matmul",
+            tensor_matmul_replacement,
         ),
     ):
         current_location().set_fx_location()
@@ -433,7 +450,18 @@ class WalkDeviceAST(NodeVisitor):
             self.visit(stmt)
 
     def visit_BinOp(self, node: ast.BinOp) -> object:
-        return _eval_binary(node.op, self.visit(node.left), self.visit(node.right))
+        left = self.visit(node.left)
+        right = self.visit(node.right)
+        # Special handling for Tile + offset: expand to tile.index + offset
+        # and mark with metadata for indexing strategies to recognize
+        if (
+            isinstance(node.op, ast.Add)
+            and isinstance(left, Tile)
+            and isinstance(right, (int, torch.SymInt))
+        ):
+            # Implicitly expand to tile.index + offset
+            left = hl.tile_index(left)
+        return _eval_binary(node.op, left, right)
 
     def visit_UnaryOp(self, node: ast.UnaryOp) -> object:
         return _eval_unary(node.op, self.visit(node.operand))
@@ -628,7 +656,7 @@ class WalkDeviceAST(NodeVisitor):
 
             with self.disable_tracing() as tracer:
                 graph = proxy_tensor.make_fx(
-                    run_subgraph, decomposition_table=select_decomp_table()
+                    run_subgraph, decomposition_table=_get_custom_decomp_table()
                 )(*inputs.get_tensor_args()).graph
                 graph_idx = self.device_ir.add_graph(
                     graph,
@@ -711,7 +739,7 @@ class WalkDeviceAST(NodeVisitor):
 
         with self.disable_tracing() as tracer:
             body_graph = proxy_tensor.make_fx(
-                run_body, decomposition_table=select_decomp_table()
+                run_body, decomposition_table=_get_custom_decomp_table()
             )(*inputs.get_tensor_args()).graph
             assert outputs is not None
             graph_idx = self.device_ir.add_graph(
@@ -814,7 +842,12 @@ class WalkDeviceAST(NodeVisitor):
         # Return as tuple to match the expected type for tuple unrolling
         return tuple(results)
 
-    def visit_Slice(self, node: ast.Slice) -> slice:
+    def visit_Dict(self, node: ast.Dict) -> dict[object, object]:
+        keys = [self.visit(key) if key is not None else None for key in node.keys]
+        values = [self.visit(value) for value in node.values]
+        return dict(zip(keys, values, strict=False))
+
+    def visit_Slice(self, node: ast.Slice) -> slice | torch.Tensor:
         if node.lower is None:
             lower = None
         else:
@@ -827,6 +860,12 @@ class WalkDeviceAST(NodeVisitor):
             step = None
         else:
             step = self.visit(node.step)
+
+        # Convert slice to hl.arange when step is None or 1 and we have both bounds
+        # This allows FX tracing to handle slice operations with dynamic bounds
+        if lower is not None and upper is not None and (step is None or step == 1):
+            return hl.arange(lower, upper)  # pyright: ignore[reportArgumentType]
+
         return slice(lower, upper, step)
 
     def visit_Assign(self, node: ast.Assign) -> None:
@@ -1037,22 +1076,120 @@ class WalkHostAST(NodeVisitor):
             self.generic_visit(node)
 
 
+def _count_device_loads_and_stores(device_ir: DeviceIR) -> tuple[int, int, int]:
+    """Count the number of load and store operations in device code for autotuning.
+
+    Returns:
+        tuple[int, int, int]: (total_load_count, loads_without_eviction_policy, store_count)
+            - total_load_count: all loads (for indexing tunable)
+            - loads_without_eviction_policy: loads that need eviction policy tuning
+            - store_count: all stores (for indexing tunable)
+    """
+    from ..language import memory_ops
+
+    # Build set of rolled graph IDs to exclude (these are duplicates)
+    rolled_graph_ids = {
+        info.new_graph_id
+        for info in device_ir.rolled_reductions
+        if info.new_graph_id is not None
+    }
+
+    total_load_count = 0
+    loads_without_eviction_policy = 0
+    store_count = 0
+
+    # Walk all graphs except rolled duplicates
+    for graph_info in device_ir.graphs:
+        if graph_info.graph_id in rolled_graph_ids:
+            continue
+
+        for node in graph_info.graph.nodes:
+            if node.op == "call_function":
+                # Check if this is a load operation
+                if node.target is memory_ops.load:
+                    total_load_count += 1
+                    # Check if this load needs eviction policy tuning
+                    # (user can still specify eviction_policy to override tuning)
+                    eviction_policy_arg = node.kwargs.get("eviction_policy")
+                    if eviction_policy_arg is None:
+                        # Check if eviction_policy was passed as positional arg (index 3)
+                        if len(node.args) >= 4:
+                            eviction_policy_arg = node.args[3]
+                        if eviction_policy_arg is None:
+                            loads_without_eviction_policy += 1
+                # Check if this is a store operation
+                elif node.target is memory_ops.store:
+                    store_count += 1
+
+    return total_load_count, loads_without_eviction_policy, store_count
+
+
+def _register_load_store_tunables(
+    total_load_count: int, loads_without_eviction_policy: int, store_count: int
+) -> None:
+    """Register list-based tunables (indexing, eviction policies) for all device loads and stores.
+
+    Args:
+        total_load_count: Total number of loads (for indexing tunable)
+        loads_without_eviction_policy: Number of loads that need eviction policy tuning
+        store_count: Total number of stores (for indexing tunable)
+    """
+    if total_load_count == 0 and store_count == 0:
+        return
+
+    from ..autotuner.config_fragment import EnumFragment
+    from ..autotuner.config_fragment import ListOf
+    from ..autotuner.config_spec import VALID_EVICTION_POLICIES
+    from ..autotuner.config_spec import ConfigSpec
+
+    env = CompileEnvironment.current()
+
+    # Register eviction policies only for loads without explicit eviction_policy
+    if loads_without_eviction_policy > 0:
+        env.config_spec.load_eviction_policies = ListOf(
+            EnumFragment(choices=VALID_EVICTION_POLICIES),
+            length=loads_without_eviction_policy,
+        )
+        env.device_load_count = loads_without_eviction_policy
+
+    # Indexing applies to ALL loads and stores
+    total_count = total_load_count + store_count
+    if total_count > 0:
+        env.config_spec.indexing = ListOf(
+            EnumFragment(choices=ConfigSpec._valid_indexing_types()), length=total_count
+        )
+
+
 def lower_to_device_ir(func: HostFunction) -> DeviceIR:
     device_ir = DeviceIR()
     with func, device_ir, compile_lock:
         visitor = WalkHostAST(device_ir)
         for stmt in func.body:
             visitor.visit(stmt)
+        # If there are no top-level device loops, we cannot generate a valid kernel.
+        # Raise a friendly error instead of emitting an empty Triton function body.
+        if len(device_ir.root_ids) == 0:
+            raise exc.NoDeviceLoopsInKernel
         for graph in device_ir.graphs:
             prepare_graph_lowerings(graph.graph)
         for graph in device_ir.graphs:
             validate_host_tensor_usage(graph.graph)
+            add_tile_with_offset_metadata(graph)
             remove_unnecessary_tile_index(graph.graph)
             remove_unnecessary_masking(graph.graph)
         device_ir.build_rolled_reductions()
         if len(device_ir.root_ids) > 1:
             # xyz not supported with shared program IDs, but persistent kernels are allowed
             CompileEnvironment.current().config_spec.disallow_pid_type("xyz")
+
+        # Count all device loads and stores and register tunables
+        total_load_count, loads_without_eviction_policy, store_count = (
+            _count_device_loads_and_stores(device_ir)
+        )
+        _register_load_store_tunables(
+            total_load_count, loads_without_eviction_policy, store_count
+        )
+
         return device_ir
 
 
@@ -1105,6 +1242,95 @@ def validate_host_tensor_usage(graph: torch.fx.Graph) -> None:
                 ):
                     op_name = getattr(user.target, "__name__", str(user.target))
                     raise exc.HostTensorDirectUsage(scalar_tensor_name, op_name)
+
+
+def add_tile_with_offset_metadata(graph_info: GraphInfo) -> None:
+    """
+    Recognize tile.index + offset patterns and add metadata to enable tensor descriptor indexing.
+
+    This pass identifies FX nodes that represent `tile.index + offset` (where offset is an
+    integer or SymInt), and adds the `tile_with_offset` metadata to those nodes so that
+    indexing strategies can generate efficient code (e.g., tensor descriptors) for them.
+    """
+    graph = graph_info.graph
+    env = CompileEnvironment.current()
+    add_targets = (operator.add, torch.ops.aten.add.Tensor)
+    offset_types = (int, torch.SymInt)
+    for node in graph.nodes:
+        if (
+            node.op != "call_function"
+            or node.target not in add_targets
+            or node.kwargs
+            or len(node.args) != 2
+        ):
+            continue
+
+        block_id: int | None = None
+        total_offset: int | torch.SymInt = 0
+        valid = True
+
+        for arg in node.args:
+            tile_offset_value: int | torch.SymInt | None = None
+            arg_block_id: int | None = None
+
+            if isinstance(arg, torch.fx.Node):
+                meta_tile = arg.meta.get("tile_with_offset")
+                if meta_tile is not None:
+                    arg_block_id = meta_tile.get("block_id")
+                    if arg_block_id is None:
+                        valid = False
+                        break
+                    tile_offset_value = meta_tile.get("offset", 0)
+                elif (
+                    arg.op == "call_function"
+                    and arg.target == hl.tile_index
+                    and arg.args
+                    and isinstance(arg.args[0], torch.fx.Node)
+                ):
+                    tile_val = arg.args[0].meta.get("val")
+                    if isinstance(tile_val, torch.SymInt):
+                        arg_block_id = env.get_block_id(tile_val)
+                        if arg_block_id is None:
+                            valid = False
+                            break
+                        tile_offset_value = 0
+                else:
+                    val = arg.meta.get("val")
+                    if isinstance(val, offset_types):
+                        total_offset = total_offset + val
+                        continue
+
+                if arg_block_id is not None:
+                    if block_id is not None:
+                        valid = False
+                        break
+                    if tile_offset_value is None:
+                        tile_offset_value = 0
+                    block_id = arg_block_id
+                    total_offset = total_offset + tile_offset_value
+                    continue
+
+                val = arg.meta.get("val")
+                if isinstance(val, offset_types):
+                    total_offset = total_offset + val
+                    continue
+
+                valid = False
+                break
+
+            if isinstance(arg, offset_types):
+                total_offset = total_offset + arg
+                continue
+            valid = False
+            break
+
+        if not valid or block_id is None:
+            continue
+
+        node.meta["tile_with_offset"] = {
+            "block_id": block_id,
+            "offset": total_offset,
+        }
 
 
 def remove_unnecessary_tile_index(graph: torch.fx.Graph) -> None:

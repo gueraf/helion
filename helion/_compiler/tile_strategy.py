@@ -5,6 +5,7 @@ import collections
 import dataclasses
 import functools
 import itertools
+import math
 import operator
 from typing import TYPE_CHECKING
 from typing import NamedTuple
@@ -135,18 +136,42 @@ class TileStrategy:
         range_unroll_factor = env.config_spec.range_unroll_factors.config_get(
             config.range_unroll_factors, block_idx, 0
         )
-        if range_unroll_factor > 0:
-            kwargs.append(f"loop_unroll_factor={range_unroll_factor}")
-
         range_warp_specialize = env.config_spec.range_warp_specialize.config_get(
             config.range_warp_specializes, block_idx, None
         )
-        if range_warp_specialize is not None:
-            kwargs.append(f"warp_specialize={range_warp_specialize}")
-
         range_num_stages = env.config_spec.range_num_stages.config_get(
             config.range_num_stages, block_idx, 0
         )
+        num_stages = config.num_stages
+
+        if config.indexing == "tensor_descriptor":
+            # Tensor descriptor + multi-stage pipelines in addition to unrolling tend to cause
+            # CUDA "misaligned address" or "unspecified launch failure" errors.
+            if range_num_stages > 0:
+                range_num_stages = 0
+            if range_unroll_factor > 0 and num_stages > 1:
+                range_unroll_factor = 0
+        elif (
+            range_num_stages > 1
+            and range_unroll_factor > 1
+            and env.block_sizes[block_idx].size
+            and env.block_sizes[block_idx].numel.is_number
+        ):
+            # Unrolling can cause CUDA IMA with pipelining
+            # We want to ensure new step size + pipeline is within bounds
+            loop_numel = int(env.block_sizes[block_idx].numel)
+            block_size = int(env.block_sizes[block_idx].from_config_assert(config))
+            step = range_unroll_factor * block_size
+            last_offset = ((loop_numel - 1) // block_size) * block_size
+            remainder = loop_numel - last_offset
+            range_num_stages = min(
+                max(1, int(math.ceil(remainder / step))), range_num_stages
+            )
+
+        if range_unroll_factor > 0:
+            kwargs.append(f"loop_unroll_factor={range_unroll_factor}")
+        if range_warp_specialize is not None:
+            kwargs.append(f"warp_specialize={range_warp_specialize}")
         if range_num_stages > 0:
             kwargs.append(f"num_stages={range_num_stages}")
 
@@ -161,6 +186,13 @@ class TileStrategy:
         )
         if range_flatten is not None:
             kwargs.append(f"flatten={range_flatten}")
+
+        dpf_range = config.get("_triton_range_id_data_partition_factor", None)
+        dpf_value = config.get("_triton_range_value_data_partition_factor", None)
+
+        if dpf_range is not None and dpf_value is not None and dpf_range == block_idx:
+            kwargs.append(f"data_partition_factor={dpf_value}")
+
         return kwargs
 
     @staticmethod
@@ -190,6 +222,7 @@ class TileStrategy:
 
         if use_static_range:
             return f"tl.static_range({', '.join(range_args)})"
+
         range_kwargs = TileStrategy.get_tl_range_kwargs(config, block_ids[0])
         return f"tl.range({', '.join(range_args + range_kwargs)})"
 
@@ -240,12 +273,7 @@ class TileStrategy:
         self, state: CodegenState, block_size_var: str, block_size: SymIntLike
     ) -> None:
         """Helper to setup constexpr block size variable on host."""
-        if state.device_function.constexpr_arg(block_size_var):
-            state.codegen.host_statements.append(
-                statement_from_string(
-                    f"{block_size_var} = {HostFunction.current().literal_expr(block_size)}"
-                )
-            )
+        state.device_function.constexpr_arg_with_host_def(block_size_var, block_size)
 
 
 class BlockSizeTileStrategy(TileStrategy):
@@ -607,7 +635,7 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
     def _to_ast(self, x: object, to_dtype: str | None = None) -> ast.AST:
         if isinstance(x, ast.AST):
             if to_dtype:
-                return expr_from_string(f"value.to({to_dtype})", value=x)
+                return expr_from_string(f"{{value}}.to({to_dtype})", value=x)
             return x
         if isinstance(x, int):
             return expr_from_string(repr(x))
@@ -660,8 +688,8 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                     self.get_range_call_str(
                         state.config,
                         [block_idx],
-                        begin="begin",
-                        end="end",
+                        begin="{begin}",
+                        end="{end}",
                         step=block_size_var,
                     ),
                     begin=self._to_ast(begin, to_dtype=dtype),
@@ -734,7 +762,7 @@ class NDTileStrategy(_BaseNDTileStrategy):
             f"mask_{block_idx}", dce=True
         )
         return statement_from_string(
-            f"{mask_var} = ({index_var}) < end", end=self._to_ast(end)
+            f"{mask_var} = ({index_var}) < {{end}}", end=self._to_ast(end)
         )
 
     def select_pid_strategy(self) -> ProgramIDs:

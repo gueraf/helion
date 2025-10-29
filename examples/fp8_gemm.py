@@ -11,17 +11,19 @@ torch._scaled_mm for correctness comparison, and a test function to validate the
 from __future__ import annotations
 
 import os
+from typing import Callable
 
 import torch
 
 import helion
+from helion._testing import DEVICE
 from helion._testing import run_example
 import helion.language as hl
 
 # Override default config to work around Triton tl.dot requirement:
 # `AssertionError: Input shapes should have M >= 16, N >= 16 and K >= 32`
 config = None
-if os.environ.get("HELION_USE_DEFAULT_CONFIG") == "1":
+if os.environ.get("HELION_AUTOTUNE_EFFORT") == "none":
     config = helion.Config(block_sizes=[32, 32, 32])
 
 
@@ -79,16 +81,25 @@ def reference_fp8_gemm_pytorch(
 
 
 # %%
-def fp8_gemm_tritonbench(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+def fp8_gemm_tritonbench(
+    tb_op: object,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    scale_a: torch.Tensor,
+    scale_b: torch.Tensor,
+) -> Callable[[], torch.Tensor]:
     """
     Wrapper for TritonBench compatibility.
     Args:
+        tb_op: TritonBench operator instance
         a (torch.Tensor): Left input tensor in FP8 format.
         b (torch.Tensor): Right input tensor in FP8 format.
+        scale_a (torch.Tensor): Scale factor for tensor a (unused in our implementation).
+        scale_b (torch.Tensor): Scale factor for tensor b (unused in our implementation).
     Returns:
-        torch.Tensor: Output tensor in FP16 format.
+        Callable that returns output tensor in FP16 format.
     """
-    return fp8_gemm(a, b)
+    return lambda: fp8_gemm(a, b)
 
 
 # %%
@@ -101,8 +112,8 @@ def check(m: int, k: int, n: int) -> None:
         n (int): Number of columns in the right input matrix.
     """
     # Create FP8 tensors
-    x = torch.randn([m, k], device="cuda", dtype=torch.float32)
-    y = torch.randn([k, n], device="cuda", dtype=torch.float32)
+    x = torch.randn([m, k], device=DEVICE, dtype=torch.float32)
+    y = torch.randn([k, n], device=DEVICE, dtype=torch.float32)
     # Convert to FP8 format (e4m3fn is commonly used for forward pass)
     x_fp8 = x.to(torch.float8_e4m3fn)
     y_fp8 = y.to(torch.float8_e4m3fn)

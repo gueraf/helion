@@ -16,7 +16,6 @@ import torch
 from torch._inductor.runtime.triton_heuristics import (
     get_max_y_grid,  # type: ignore[import-untyped]
 )
-from triton import cdiv
 import triton.language
 
 from .. import exc
@@ -24,6 +23,7 @@ from .._compiler.ast_extension import ExtendedAST
 from .._compiler.ast_extension import LoopType
 from .._compiler.ast_extension import expr_from_string
 from .._compiler.compile_environment import CompileEnvironment
+from .._compiler.compile_environment import warning
 from .._compiler.type_propagation import GridIndexType
 from .._compiler.type_propagation import IterType
 from .._compiler.type_propagation import LiteralType
@@ -50,6 +50,7 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from .._compiler.inductor_lowering import CodegenState
+    from .constexpr import ConstExpr
 
 
 __all__ = ["grid", "static_range", "tile"]
@@ -258,7 +259,10 @@ def _allow_static_range(begin: object, end: object, step: object) -> bool:
     if step is None:
         count = end - begin
     elif isinstance(step, int):
-        count = cdiv(begin - end, step)
+        # Use integer math to avoid Triton constexpr types
+        # Compute ceil((end - begin) / step)
+        delta = end - begin
+        count = (delta + step - 1) // step
     else:
         return False
     # Unrolling a long static range leads to compile timeouts
@@ -323,6 +327,12 @@ def _(
         block_size_list = cast(
             "list[int | torch.SymInt | torch.Tensor | None]", proxy_block_size
         )
+    block_size_list = Tile._tiles_to_sizes(block_size_list)
+
+    if unpack:
+        target = getattr(parent, "target", None)
+        if isinstance(target, (ast.Tuple, ast.List)) and len(target.elts) > 1:
+            raise exc.FailedToUnpackTile from None
 
     results = []
     for begin_part, end_part, bs in zip(
@@ -331,7 +341,11 @@ def _(
         block_size_list,
         strict=True,
     ):
+        if isinstance(begin_part, Tile) or isinstance(end_part, Tile):
+            raise exc.TileOfTile
         size = end_part - begin_part  # type: ignore[operator]
+        if isinstance(size, int) and size < 0:
+            raise exc.InvalidTileRange(begin_part, end_part)
         if isinstance(size, torch.Tensor):
             size = None  # data dependent size
         if bs is None:
@@ -430,7 +444,7 @@ def _supports_warp_specialize() -> bool:
     env = CompileEnvironment.current()
     if env.device.type != "cuda" or not env.settings.allow_warp_specialize:
         return False
-    return torch.cuda.get_device_capability() >= (12, 0)
+    return torch.cuda.get_device_capability() >= (10, 0)
 
 
 def _allow_use_yz_grid(config_spec: ConfigSpec, block_ids: list[int]) -> bool:
@@ -494,6 +508,10 @@ def _(
     end_or_none: int | torch.Tensor | list[int | torch.Tensor] | None = None,
     block_size: int | torch.Tensor | list[int | torch.Tensor] | None = None,
 ) -> Iterator[RefTile | tuple[RefTile, ...]]:
+    # Issue warning if block_size is specified in interpret mode
+    if block_size is not None:
+        warning(exc.BlockSizeIgnoredInInterpretMode(block_size))
+
     # Step 1: Normalize begin and end values
     begin, end = _normalize_begin_end_ref(begin_or_end, end_or_none)
 
@@ -565,10 +583,14 @@ def _codegen_loop_helper(
     is_device_loop=True, is_device_only=False, cache_type=True, tiles_as_sizes=True
 )
 def grid(
-    begin_or_end: int | torch.Tensor,
-    end_or_none: int | torch.Tensor | None = None,
+    begin_or_end: int | torch.Tensor | ConstExpr,
+    end_or_none: int | torch.Tensor | ConstExpr | None = None,
     /,
-    step: int | torch.Tensor | Sequence[int | torch.Tensor] | None = None,
+    step: int
+    | torch.Tensor
+    | ConstExpr
+    | Sequence[int | torch.Tensor | ConstExpr]
+    | None = None,
 ) -> Iterator[torch.SymInt]: ...
 
 
@@ -578,10 +600,14 @@ def grid(
     is_device_loop=True, is_device_only=False, cache_type=True, tiles_as_sizes=True
 )
 def grid(
-    begin_or_end: Sequence[int | torch.Tensor],
-    end_or_none: Sequence[int | torch.Tensor] | None = None,
+    begin_or_end: Sequence[int | torch.Tensor | ConstExpr],
+    end_or_none: Sequence[int | torch.Tensor | ConstExpr] | None = None,
     /,
-    step: int | torch.Tensor | Sequence[int | torch.Tensor] | None = None,
+    step: int
+    | torch.Tensor
+    | ConstExpr
+    | Sequence[int | torch.Tensor | ConstExpr]
+    | None = None,
 ) -> Iterator[Sequence[torch.SymInt]]: ...
 
 
@@ -590,10 +616,21 @@ def grid(
     is_device_loop=True, is_device_only=False, cache_type=True, tiles_as_sizes=True
 )
 def grid(
-    begin_or_end: int | torch.Tensor | Sequence[int | torch.Tensor],
-    end_or_none: int | torch.Tensor | Sequence[int | torch.Tensor] | None = None,
+    begin_or_end: int
+    | torch.Tensor
+    | ConstExpr
+    | Sequence[int | torch.Tensor | ConstExpr],
+    end_or_none: int
+    | torch.Tensor
+    | ConstExpr
+    | Sequence[int | torch.Tensor | ConstExpr]
+    | None = None,
     /,
-    step: int | torch.Tensor | Sequence[int | torch.Tensor] | None = None,
+    step: int
+    | torch.Tensor
+    | ConstExpr
+    | Sequence[int | torch.Tensor | ConstExpr]
+    | None = None,
 ) -> Iterator[torch.SymInt] | Iterator[Sequence[torch.SymInt]]:  # type: ignore[type-arg]
     """Iterate over individual indices of the given iteration space.
 

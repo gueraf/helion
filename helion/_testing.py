@@ -17,13 +17,16 @@ import unittest
 
 import pytest
 import torch
-from triton.testing import do_bench
+from torch.utils._pytree import tree_map
+import triton
 
+from ._compat import get_tensor_descriptor_fn_name
 from ._utils import counters
+from .autotuner.benchmarking import compute_repeat
+from .autotuner.benchmarking import interleaved_bench
 from .runtime.config import Config
-import helion
-from helion._compat import get_tensor_descriptor_fn_name
-from helion.runtime.ref_mode import is_ref_mode_enabled
+from .runtime.ref_mode import is_ref_mode_enabled
+from .runtime.settings import RefMode
 
 if TYPE_CHECKING:
     import types
@@ -31,8 +34,30 @@ if TYPE_CHECKING:
     from .runtime.kernel import Kernel
 
 
-DEVICE = torch.device("cuda")
-EXAMPLES_DIR: Path = Path(__file__).parent.parent / "examples"
+DEVICE = torch.device("xpu") if torch.xpu.is_available() else torch.device("cuda")
+PROJECT_ROOT: Path = Path(__file__).parent.parent
+EXAMPLES_DIR: Path = PROJECT_ROOT / "examples"
+
+
+def is_cuda() -> bool:
+    """Return True if running on CUDA (NVIDIA GPU)."""
+    return (
+        triton.runtime.driver.active.get_current_target().backend == "cuda"  # pyright: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
+        and DEVICE.type == "cuda"
+    )
+
+
+def get_nvidia_gpu_model() -> str:
+    """
+    Retrieves the model of the NVIDIA GPU being used.
+    Will return the name of the current device.
+    Returns:
+        str: The model of the NVIDIA GPU or empty str if not found.
+    """
+    if torch.cuda.is_available():
+        props = torch.cuda.get_device_properties(torch.cuda.current_device())
+        return getattr(props, "name", "")
+    return ""
 
 
 def skipIfRefEager(reason: str) -> Callable[[Callable], Callable]:
@@ -50,6 +75,48 @@ def skipIfRocm(reason: str) -> Callable[[Callable], Callable]:
     return unittest.skipIf(torch.version.hip is not None, reason)  # pyright: ignore[reportAttributeAccessIssue]
 
 
+def skipIfXPU(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test if running with Intel XPU"""
+    return unittest.skipIf(torch.xpu.is_available(), reason)  # pyright: ignore[reportAttributeAccessIssue]
+
+
+def skipIfA10G(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test if running on A10G GPU"""
+    gpu_model = get_nvidia_gpu_model()
+    is_a10g = "A10G" in gpu_model
+    return unittest.skipIf(is_a10g, reason)
+
+
+def skipIfNotCUDA() -> Callable[[Callable], Callable]:
+    """Skip test if not running on CUDA (NVIDIA GPU)."""
+    return unittest.skipIf(
+        not is_cuda(), "Test skipped: CUDA (NVIDIA GPU) is not available."
+    )
+
+
+def skipIfLowVRAM(
+    reason: str = "Test requires high VRAM",
+) -> Callable[[Callable], Callable]:
+    """Skip test on systems with low GPU VRAM."""
+
+    threshold_bytes = int(30.0 * (1024**3))
+    total_memory: int | None = None
+    try:
+        if torch.cuda.is_available():
+            props = torch.cuda.get_device_properties(torch.cuda.current_device())
+            total_memory = int(getattr(props, "total_memory", 0))
+    except Exception:
+        total_memory = None
+
+    low_vram = total_memory is not None and total_memory < threshold_bytes
+    return unittest.skipIf(low_vram, reason)
+
+
+def skipIfPy314(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test if running on Python 3.14"""
+    return unittest.skipIf(sys.version_info >= (3, 14), reason)
+
+
 @contextlib.contextmanager
 def track_run_ref_calls() -> Generator[list[int], None, None]:
     """Context manager that tracks BoundKernel.run_ref calls.
@@ -57,7 +124,7 @@ def track_run_ref_calls() -> Generator[list[int], None, None]:
     Yields:
         A list that will contain the count of run_ref calls.
     """
-    from helion.runtime.kernel import BoundKernel
+    from .runtime.kernel import BoundKernel
 
     original_run_ref = BoundKernel.run_ref
     run_ref_count = [0]
@@ -76,7 +143,7 @@ def track_run_ref_calls() -> Generator[list[int], None, None]:
 
 @contextlib.contextmanager
 def assert_helion_ref_mode(
-    ref_mode: helion.RefMode = helion.RefMode.OFF,
+    ref_mode: RefMode = RefMode.OFF,
 ) -> Generator[None, None, None]:
     """Context manager that asserts Helion compilation behavior based on RefMode.
 
@@ -86,12 +153,12 @@ def assert_helion_ref_mode(
     with track_run_ref_calls() as run_ref_count:
         yield
 
-        if ref_mode == helion.RefMode.OFF:
+        if ref_mode == RefMode.OFF:
             # In normal mode (RefMode.OFF), run_ref should not be called
             assert run_ref_count[0] == 0, (
                 f"Expected run_ref to not be called in normal mode (RefMode.OFF), but got: run_ref={run_ref_count[0]}"
             )
-        elif ref_mode == helion.RefMode.EAGER:
+        elif ref_mode == RefMode.EAGER:
             # In ref eager mode (RefMode.EAGER), run_ref should be called
             assert run_ref_count[0] > 0, (
                 f"Expected run_ref to be called in ref eager mode (RefMode.EAGER), but got: run_ref={run_ref_count[0]}"
@@ -101,11 +168,11 @@ def assert_helion_ref_mode(
 
 
 assert_helion_compilation = functools.partial(
-    assert_helion_ref_mode, ref_mode=helion.RefMode.OFF
+    assert_helion_ref_mode, ref_mode=RefMode.OFF
 )
 
 assert_ref_eager_mode = functools.partial(
-    assert_helion_ref_mode, ref_mode=helion.RefMode.EAGER
+    assert_helion_ref_mode, ref_mode=RefMode.EAGER
 )
 
 
@@ -123,6 +190,13 @@ class RefEagerTestBase:
     _original_skip_test_func = None
     # Class-level tracking for pytest.raises patching
     _original_pytest_raises = None
+    # Class-level tracking for assertTrue/assertFalse/assertGreater
+    _assert_true_count = 0
+    _original_assert_true_func = None
+    _assert_false_count = 0
+    _original_assert_false_func = None
+    _assert_greater_count = 0
+    _original_assert_greater_func = None
 
     def setUp(self) -> None:
         """Common setup for all ref eager tests."""
@@ -141,6 +215,10 @@ class RefEagerTestBase:
         RefEagerTestBase._assert_raises_count = 0
         # Reset skipTest counter for this test
         RefEagerTestBase._skip_test_count = 0
+        # Reset assertTrue/assertFalse/assertGreater counters
+        RefEagerTestBase._assert_true_count = 0
+        RefEagerTestBase._assert_false_count = 0
+        RefEagerTestBase._assert_greater_count = 0
 
         # Patch torch.testing.assert_close to count calls
         if RefEagerTestBase._original_assert_close_func is None:
@@ -188,6 +266,36 @@ class RefEagerTestBase:
 
         pytest.raises = counting_pytest_raises  # type: ignore[assignment]
 
+        # Patch self.assertTrue to count calls
+        if RefEagerTestBase._original_assert_true_func is None:
+            RefEagerTestBase._original_assert_true_func = self.assertTrue
+
+        def counting_assert_true(*args: object, **kwargs: object) -> None:
+            RefEagerTestBase._assert_true_count += 1
+            return RefEagerTestBase._original_assert_true_func(*args, **kwargs)  # type: ignore[misc]
+
+        self.assertTrue = counting_assert_true  # type: ignore[assignment]
+
+        # Patch self.assertFalse to count calls
+        if RefEagerTestBase._original_assert_false_func is None:
+            RefEagerTestBase._original_assert_false_func = self.assertFalse
+
+        def counting_assert_false(*args: object, **kwargs: object) -> None:
+            RefEagerTestBase._assert_false_count += 1
+            return RefEagerTestBase._original_assert_false_func(*args, **kwargs)  # type: ignore[misc]
+
+        self.assertFalse = counting_assert_false  # type: ignore[assignment]
+
+        # Patch self.assertGreater to count calls
+        if RefEagerTestBase._original_assert_greater_func is None:
+            RefEagerTestBase._original_assert_greater_func = self.assertGreater
+
+        def counting_assert_greater(*args: object, **kwargs: object) -> None:
+            RefEagerTestBase._assert_greater_count += 1
+            return RefEagerTestBase._original_assert_greater_func(*args, **kwargs)  # type: ignore[misc]
+
+        self.assertGreater = counting_assert_greater  # type: ignore[assignment]
+
     def tearDown(self) -> None:
         """Common teardown with assertion counting check."""
         # If not in ref eager mode, skip the teardown logic
@@ -214,17 +322,27 @@ class RefEagerTestBase:
                 )
 
             if not is_skipped:
-                # Check that either assert_close, assertRaises, or skipTest was called
+                # Check that either assert_close, assertRaises, skipTest, assertTrue, assertFalse, or assertGreater was called
                 total_assertions = (
                     RefEagerTestBase._assert_close_count
                     + RefEagerTestBase._assert_raises_count
                     + RefEagerTestBase._skip_test_count
+                    + RefEagerTestBase._assert_true_count
+                    + RefEagerTestBase._assert_false_count
+                    + RefEagerTestBase._assert_greater_count
                 )
-                self.assertGreater(  # type: ignore[attr-defined]
-                    total_assertions,
-                    0,
-                    f"Test {self._testMethodName} did not call torch.testing.assert_close, assertRaises, or skipTest",  # type: ignore[attr-defined]  # pyright: ignore[reportAttributeAccessIssue]
-                )
+                # Need to use the original assertGreater to avoid recursion
+                if RefEagerTestBase._original_assert_greater_func is not None:
+                    RefEagerTestBase._original_assert_greater_func(  # type: ignore[misc]
+                        total_assertions,
+                        0,
+                        f"Test {self._testMethodName} did not call torch.testing.assert_close, assertRaises, skipTest, assertTrue, assertFalse, or assertGreater",  # type: ignore[attr-defined]  # pyright: ignore[reportAttributeAccessIssue]
+                    )
+                else:
+                    # Fallback if original not available
+                    assert total_assertions > 0, (
+                        f"Test {self._testMethodName} did not call any assertion methods"  # type: ignore[attr-defined]  # pyright: ignore[reportAttributeAccessIssue]
+                    )
         finally:
             # Restore the original assert_close function
             if RefEagerTestBase._original_assert_close_func is not None:
@@ -243,6 +361,18 @@ class RefEagerTestBase:
             # Restore the original pytest.raises function
             if RefEagerTestBase._original_pytest_raises is not None:  # pyright: ignore[reportAttributeAccessIssue]
                 pytest.raises = RefEagerTestBase._original_pytest_raises  # pyright: ignore[reportAttributeAccessIssue]
+
+            # Restore the original assertTrue function
+            if RefEagerTestBase._original_assert_true_func is not None:
+                self.assertTrue = RefEagerTestBase._original_assert_true_func
+
+            # Restore the original assertFalse function
+            if RefEagerTestBase._original_assert_false_func is not None:
+                self.assertFalse = RefEagerTestBase._original_assert_false_func
+
+            # Restore the original assertGreater function
+            if RefEagerTestBase._original_assert_greater_func is not None:
+                self.assertGreater = RefEagerTestBase._original_assert_greater_func
 
             super().tearDown()  # type: ignore[misc]
 
@@ -346,6 +476,7 @@ def run_example(
     baseline_name: str = "torch",
     rtol: float = 1e-2,
     atol: float = 1e-1,
+    bwd: bool = False,
 ) -> None:
     """Run complete example: correctness check + benchmark.
 
@@ -357,8 +488,13 @@ def run_example(
         baseline_name: Name for single baseline in output (default: "torch")
         rtol: Relative tolerance for correctness check (default: 1e-2)
         atol: Absolute tolerance for correctness check (default: 1e-1)
+        bwd: Whether to also test backward pass (default: False)
     """
-    torch.set_float32_matmul_precision("high")
+    try:
+        torch.backends.cuda.matmul.fp32_precision = "tf32"
+        torch.backends.cudnn.conv.fp32_precision = "tf32"  # type: ignore[reportAttributeAccessIssue]
+    except AttributeError:  # No cudnn available
+        torch.set_float32_matmul_precision("high")  # older deprecated API
 
     # Normalize to dict format
     kernels = kernel_fn if isinstance(kernel_fn, dict) else {kernel_name: kernel_fn}
@@ -380,12 +516,87 @@ def run_example(
                 atol=atol,
             )
 
-    # Benchmark all functions
-    all_times = {
-        name: do_bench(lambda fn=fn: fn(*args))
-        for name, fn in {**kernels, **baselines}.items()
-    }
+    # Test backward pass
+    if bwd:
+        # Find tensors that require gradients in args
+        grad_tensors = []
+        for arg in args:
+            if isinstance(arg, torch.Tensor) and arg.requires_grad:
+                grad_tensors.append(arg)
 
+        # Ensure we have tensors to check
+        assert len(grad_tensors) > 0, (
+            "BWD: No tensors with requires_grad=True found. "
+            "Check that input tensors have requires_grad set."
+        )
+
+        # Run baseline backward pass
+        baseline_out = first_baseline_func(*args)
+        grad_output = torch.randn_like(baseline_out)
+
+        # Save original gradients
+        baseline_out.backward(grad_output, retain_graph=True)
+        baseline_grads = [
+            t.grad.clone() if t.grad is not None else None for t in grad_tensors
+        ]
+
+        # Ensure at least one gradient was computed
+        has_gradient = any(g is not None for g in baseline_grads)
+        assert has_gradient, (
+            "BWD: No gradients were computed. All tensors have grad=None. "
+            "Check that backward was called and tensors require gradients."
+        )
+
+        # Clear gradients
+        for t in grad_tensors:
+            t.grad = None
+
+        # Test each implementation
+        for name, func in {**kernels, **baselines}.items():
+            if name != first_baseline_name:
+                # Run backward
+                out = func(*args)
+                out.backward(grad_output, retain_graph=True)
+
+                # Collect implementation gradients
+                impl_grads = [t.grad for t in grad_tensors]
+
+                # Ensure same number of grad tensors
+                assert len(impl_grads) == len(baseline_grads), (
+                    f"BWD: Mismatch in number of grad tensors for {name}: "
+                    f"{len(impl_grads)} vs {len(baseline_grads)}"
+                )
+
+                # Compare each tensor's gradient
+                for i, (tensor, baseline_grad) in enumerate(
+                    zip(grad_tensors, baseline_grads, strict=False)
+                ):
+                    # Check gradient existence
+                    assert (baseline_grad is None) == (tensor.grad is None), (
+                        f"BWD: Gradient existence mismatch for tensor {i} in {name}: "
+                        f"baseline has grad={baseline_grad is not None}, "
+                        f"impl has grad={tensor.grad is not None}"
+                    )
+
+                    if baseline_grad is not None:
+                        torch.testing.assert_close(
+                            tensor.grad.to(torch.float32),
+                            baseline_grad.to(torch.float32),
+                            rtol=rtol,
+                            atol=atol,
+                            msg=f"BWD: Gradient mismatch for tensor {i} with shape {tensor.shape} in {name}",
+                        )
+
+                # Clear gradients for next test
+                for t in grad_tensors:
+                    t.grad = None
+
+    # Benchmark all functions
+    all_benchmarks = {**kernels, **baselines}
+    bench_fns = [functools.partial(fn, *args) for fn in all_benchmarks.values()]
+    repeat = compute_repeat(bench_fns[0])
+    timings = interleaved_bench(bench_fns, repeat=repeat, desc="Benchmarking")
+    all_times = dict(zip(all_benchmarks.keys(), timings, strict=True))
     best_baseline_time = min(all_times[name] for name in baselines)  # pyright: ignore[reportArgumentType]
 
     # Print results
@@ -408,7 +619,7 @@ def run_example(
 def check_example(
     name: str,
     args: tuple[torch.Tensor, ...],
-    expected: torch.Tensor,
+    expected: object,
     fn_name: str | None = None,
     skip_accuracy: bool = False,
     static_shapes: bool | None = None,
@@ -428,15 +639,26 @@ def check_example(
         **kwargs,
     )
 
-    assert isinstance(result, torch.Tensor)
-
     if not skip_accuracy:
-        torch.testing.assert_close(
-            result.to(torch.float32),
-            expected.to(torch.float32),
-            atol=atol,
-            rtol=rtol,
-        )
+        # Use tree_map to apply assert_close to all tensor pairs
+        def assert_close_fn(got: object, exp: object) -> None:
+            # Skip if expected is None (i.e. we don't care what the actual value is)
+            if exp is None:
+                return
+            # Both None is OK
+            if got is None and exp is None:
+                return
+            assert isinstance(got, torch.Tensor) and isinstance(exp, torch.Tensor), (
+                f"Type mismatch: got {type(got)}, expected {type(exp)}"
+            )
+            torch.testing.assert_close(
+                got.to(torch.float32),
+                exp.to(torch.float32),
+                atol=atol,
+                rtol=rtol,
+            )
+
+        tree_map(assert_close_fn, result, expected)
     return code
 
 
@@ -518,6 +740,105 @@ class AssertExpectedJournal:
             get_tensor_descriptor_fn_name(), "tl.make_tensor_descriptor"
         )
 
+    @staticmethod
+    def normalize_device_name(code: str) -> str:
+        """
+        convert device='cuda:0' or device(type='cuda', index=0) etc to device=DEVICE
+        """
+        # device='cuda:0'
+        reg_pattern_for_device_str = r"device\s*=\s*['\"][^'\"]+['\"]"
+        normalized_code = re.sub(reg_pattern_for_device_str, "device=DEVICE", code)
+        # device(type='cuda', index=0)
+        reg_pattern_for_torch_device = (
+            r"device\s*\(type\s*=\s*['\"][^'\"]+['\"][^'\"\)]*\)"
+        )
+        return re.sub(reg_pattern_for_torch_device, "device=DEVICE", normalized_code)
+
+    @staticmethod
+    def normalize_codegen_variants(code: str) -> str:
+        # TODO(oulgen): Remove when PyTorch 2.10 becomes stable
+
+        # Remove libdevice import line if present
+        code = re.sub(
+            r"^\s*from torch\._inductor\.runtime\.triton_compat import libdevice\s*\n?",
+            "",
+            code,
+            flags=re.MULTILINE,
+        )
+
+        # Normalize sqrt variants
+        # libdevice.sqrt( -> tl.sqrt_rn(
+        code = re.sub(r"\blibdevice\.sqrt\s*\(", "tl.sqrt_rn(", code)
+        # tl.sqrt( -> tl.sqrt_rn(
+        code = re.sub(r"\btl\.sqrt\s*\(", "tl.sqrt_rn(", code)
+
+        # Normalize rsqrt variants
+        # libdevice.rsqrt( -> tl.rsqrt(
+        code = re.sub(r"\blibdevice\.rsqrt\s*\(", "tl.rsqrt(", code)
+
+        total_num_triton_helpers_replacements = 0
+
+        # Normalize maximum variants
+        # tl.maximum(a, b, tl.PropagateNan.ALL) -> triton_helpers.maximum(a, b)
+        code, num_replacements = re.subn(
+            r"\btl\.maximum\s*\(([^,]+),\s*([^,]+),\s*tl\.PropagateNan\.ALL\s*\)",
+            r"triton_helpers.maximum(\1, \2)",
+            code,
+        )
+        total_num_triton_helpers_replacements += num_replacements
+
+        # Normalize minimum variants
+        # tl.minimum(a, b, tl.PropagateNan.ALL) -> triton_helpers.minimum(a, b)
+        code, num_replacements = re.subn(
+            r"\btl\.minimum\s*\(([^,]+),\s*([^,]+),\s*tl\.PropagateNan\.ALL\s*\)",
+            r"triton_helpers.minimum(\1, \2)",
+            code,
+        )
+        total_num_triton_helpers_replacements += num_replacements
+
+        triton_helpers_import = "from torch._inductor.runtime import triton_helpers"
+        if (
+            total_num_triton_helpers_replacements > 0
+            and triton_helpers_import not in code
+        ):
+            # Insert right after `import triton.language as tl`
+            code = re.sub(
+                r"(^import triton\.language as tl$)",
+                rf"\1\n{triton_helpers_import}",
+                code,
+                count=1,
+                flags=re.MULTILINE,
+            )
+
+        return code
+
+    @staticmethod
+    def normalize_source_comment_structure(code: str) -> str:
+        pattern = re.compile(
+            r"^(?P<indent>\s*)# src\[(?P<prefix>[^:\]]+:)(?P<start>\d+|N)(?:-(?P<end>\d+|N))?]: (?P<text>.*?)(?P<newline>\r?\n|$)",
+            flags=re.MULTILINE,
+        )
+
+        def replacer(match: re.Match[str]) -> str:
+            text = match.group("text").rstrip()
+            if not text.strip():
+                return ""
+            indent = match.group("indent")
+            prefix = match.group("prefix")
+            suffix = "N-N" if match.group("end") is not None else "N"
+            newline = match.group("newline")
+            return f"{indent}# src[{prefix}{suffix}]: {text}{newline}"
+
+        return pattern.sub(replacer, code)
+
+    @classmethod
+    def normalize_code(cls, code: str) -> str:
+        code = cls.normalize_source_comment_structure(code)
+        code = cls.normalize_tensor_descriptors(code)
+        code = cls.normalize_device_name(code)
+        code = cls.normalize_codegen_variants(code)
+        return code.strip()
+
     def lookup(self, test_id: str, value: str) -> tuple[str, str]:
         test_id = self.normalize_id(test_id)
         if self._current_id != test_id:
@@ -532,8 +853,10 @@ class AssertExpectedJournal:
             expected_values.append("")
             expected = ""
 
-        value = self.normalize_tensor_descriptors(value)
-        value = value.strip()
+        # Normalize both actual and expected for robust comparisons
+        value = self.normalize_code(value)
+        expected = self.normalize_code(expected)
+
         if value != expected and os.environ.get("EXPECTTEST_ACCEPT", "0") not in {
             "0",
             "false",

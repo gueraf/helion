@@ -4,19 +4,24 @@ import ast
 from typing import TYPE_CHECKING
 
 import torch
-from torch._inductor.codegen.simd import constant_repr
 from torch.fx import has_side_effect
 
 from .. import exc
-from .._compiler.ast_extension import expr_from_string
 from .._compiler.indexing_strategy import SubscriptIndexing
 from . import _decorators
-from helion.language.stack_tensor import StackTensor
+from .stack_tensor import StackTensor
 
 if TYPE_CHECKING:
     from .._compiler.inductor_lowering import CodegenState
 
-__all__ = ["atomic_add", "load", "store"]
+__all__ = ["load", "store"]
+
+# Map short config names to full Triton API names for eviction policies
+_EVICTION_POLICY_MAP = {
+    "": None,
+    "first": "evict_first",
+    "last": "evict_last",
+}
 
 
 @has_side_effect
@@ -91,9 +96,13 @@ def _(state: CodegenState) -> ast.AST:
     assert isinstance(extra_mask, (type(None), ast.AST))
 
     if isinstance(tensor, torch.Tensor):
-        return state.device_function.indexing_strategy.codegen_store(
-            state, tensor, [*subscript], value, extra_mask
-        )
+        device_fn = state.device_function
+        device_fn.device_store_index += 1
+        # Use the shared memory op index for indexing strategy
+        indexing_idx = device_fn.device_memory_op_index
+        device_fn.device_memory_op_index += 1
+        strategy = device_fn.get_indexing_strategy(indexing_idx)
+        return strategy.codegen_store(state, tensor, [*subscript], value, extra_mask)
     if isinstance(tensor, tuple):
         from .._compiler.indexing_strategy import StackIndexingStrategy
 
@@ -115,31 +124,63 @@ def _(
     value: torch.Tensor | torch.SymInt | float,
     extra_mask: torch.Tensor | None = None,
 ) -> None:
-    # Convert index list to tuple for tensor indexing
-    index_tuple = tuple(index)
+    from .ref_tile import RefTile
 
-    # Apply extra mask if provided
+    # Normalize indices and identify tensor indices
+    indices = []
+    tensor_idx_positions = []
+    for i, idx in enumerate(index):
+        if isinstance(idx, RefTile):
+            idx = idx.index
+        indices.append(idx)
+        if isinstance(idx, torch.Tensor):
+            tensor_idx_positions.append(i)
+
+    # Handle broadcasting for multiple tensor indices
+    if len(tensor_idx_positions) > 1:
+        grids = torch.meshgrid(
+            *(indices[i] for i in tensor_idx_positions), indexing="ij"
+        )
+        for i, grid in zip(tensor_idx_positions, grids, strict=False):
+            indices[i] = grid
+
     if extra_mask is not None:
-        # Only store where the mask is True
-        if isinstance(value, torch.Tensor):
-            tensor[index_tuple] = torch.where(extra_mask, value, tensor[index_tuple])  # pyright: ignore[reportArgumentType]
-        else:
-            # For scalar values, we need to create a tensor of the right shape
-            current = tensor[index_tuple]  # pyright: ignore[reportArgumentType]
-            # Cast value to a proper numeric type for full_like
-            if isinstance(value, torch.SymInt):
-                numeric_value = int(value)
+        mask = extra_mask.to(torch.bool)
+
+        # Check bounds for tensor indices
+        for i, idx in enumerate(indices):
+            if isinstance(idx, torch.Tensor):
+                mask = mask & (idx >= 0) & (idx < tensor.shape[i])
+        mask_count = int(mask.sum().item())
+        if mask_count == 0:
+            return
+
+        # Use index_put_ for masked stores
+        valid_indices = []
+        for idx in indices:
+            if isinstance(idx, torch.Tensor):
+                valid_indices.append(idx[mask].long())
             else:
-                numeric_value = value
-            tensor[index_tuple] = torch.where(  # pyright: ignore[reportArgumentType]
-                extra_mask, torch.full_like(current, numeric_value), current
-            )
-    else:
-        # Handle SymInt case for assignment
-        if isinstance(value, torch.SymInt):
-            tensor[index_tuple] = int(value)  # pyright: ignore[reportArgumentType]
+                idx_val = int(idx) if isinstance(idx, torch.SymInt) else idx
+                valid_indices.append(
+                    torch.full(
+                        (mask_count,), idx_val, dtype=torch.long, device=tensor.device
+                    )
+                )
+
+        if isinstance(value, torch.Tensor):
+            values = value[mask]
         else:
-            tensor[index_tuple] = value  # pyright: ignore[reportArgumentType]
+            val = int(value) if isinstance(value, torch.SymInt) else value
+            values = torch.full(
+                (mask_count,), val, dtype=tensor.dtype, device=tensor.device
+            )
+
+        tensor.index_put_(tuple(valid_indices), values, accumulate=False)
+        return
+
+    # Simple assignment
+    tensor[tuple(indices)] = int(value) if isinstance(value, torch.SymInt) else value
 
 
 @_decorators.api(tiles_as_sizes=True, allow_host_tensor=True)
@@ -147,17 +188,21 @@ def load(
     tensor: torch.Tensor | StackTensor,
     index: list[object],
     extra_mask: torch.Tensor | None = None,
+    eviction_policy: str | None = None,
 ) -> torch.Tensor:
     """Load a value from a tensor using a list of indices.
 
     This function is equivalent to `tensor[index]` but allows
     setting `extra_mask=` to mask elements beyond the default masking
-    based on the hl.tile range.
+    based on the hl.tile range. It also accepts an optional
+    `eviction_policy` which is forwarded to the underlying Triton `tl.load`
+    call to control the cache eviction behavior (e.g., "evict_last").
 
     Args:
         tensor: The tensor / stack tensor to load from
         index: The indices to use to index into the tensor
         extra_mask: The extra mask (beyond automatic tile bounds masking) to apply to the tensor
+        eviction_policy: Optional Triton load eviction policy to hint cache behavior
     Returns:
         torch.Tensor: The loaded value
     """
@@ -169,14 +214,15 @@ def _(
     tensor: torch.Tensor | StackTensor,
     index: list[object],
     extra_mask: torch.Tensor | None = None,
-) -> tuple[torch.Tensor | tuple, list[object], torch.Tensor | None]:
+    eviction_policy: str | None = None,
+) -> tuple[torch.Tensor | tuple, list[object], torch.Tensor | None, str | None]:
     from .tile_proxy import Tile
 
     index = Tile._tiles_to_sizes(index)
     if isinstance(tensor, StackTensor):
-        return (tuple(tensor), index, extra_mask)
+        return (tuple(tensor), index, extra_mask, eviction_policy)
     assert isinstance(tensor, torch.Tensor)
-    return (tensor, index, extra_mask)
+    return (tensor, index, extra_mask, eviction_policy)
 
 
 @_decorators.register_fake(load)
@@ -184,6 +230,7 @@ def _(
     tensor: torch.Tensor | tuple[object, ...],
     index: list[object],
     extra_mask: torch.Tensor | None = None,
+    eviction_policy: str | None = None,
 ) -> torch.Tensor:
     if isinstance(tensor, torch.Tensor):
         target_shape = SubscriptIndexing.compute_shape(tensor, index)
@@ -205,10 +252,30 @@ def _(state: CodegenState) -> ast.AST:
     assert isinstance(subscript, (list, tuple))
     extra_mask = state.ast_args[2]
     assert isinstance(extra_mask, (type(None), ast.AST))
+    eviction_policy = state.ast_args[3] if len(state.ast_args) > 3 else None
+
+    device_fn = state.device_function
+    load_idx = device_fn.device_load_index
+    device_fn.device_load_index += 1
+
+    # If no explicit eviction_policy and we're in device code, use tunable
+    if eviction_policy is None and state.codegen.on_device:
+        policies = state.config.load_eviction_policies
+        if load_idx < len(policies):
+            policy_value = policies[load_idx]
+            eviction_policy = _EVICTION_POLICY_MAP.get(policy_value, policy_value)
+
+    if eviction_policy is not None:
+        assert isinstance(eviction_policy, str)
+        eviction_policy = ast.Constant(value=eviction_policy)
 
     if isinstance(tensor, torch.Tensor):
-        return state.device_function.indexing_strategy.codegen_load(
-            state, tensor, [*subscript], extra_mask
+        # Use the shared memory op index for indexing strategy
+        indexing_idx = device_fn.device_memory_op_index
+        device_fn.device_memory_op_index += 1
+        strategy = device_fn.get_indexing_strategy(indexing_idx)
+        return strategy.codegen_load(
+            state, tensor, [*subscript], extra_mask, eviction_policy
         )
     if isinstance(tensor, tuple):
         from .._compiler.indexing_strategy import StackIndexingStrategy
@@ -218,7 +285,7 @@ def _(state: CodegenState) -> ast.AST:
         assert len(stack_tensor_ast) == 2
         tensor_like_ast, dev_ptrs_ast = stack_tensor_ast
         return StackIndexingStrategy.codegen_load(
-            state, tensor, dev_ptrs_ast, [*subscript], extra_mask
+            state, tensor, dev_ptrs_ast, [*subscript], extra_mask, eviction_policy
         )
     raise NotImplementedError(f"Unsupported tensor type: {type(tensor)}")
 
@@ -234,6 +301,7 @@ def _(
     tensor: torch.Tensor,
     index: list[object],
     extra_mask: torch.Tensor | None = None,
+    eviction_policy: str | None = None,
 ) -> torch.Tensor:
     from .ref_tile import RefTile
 
@@ -304,162 +372,3 @@ def _(
             valid_mask = valid_mask & in_bounds
 
     return torch.where(valid_mask, values, result)
-
-
-@has_side_effect
-@_decorators.api(allow_host_tensor=True)
-def atomic_add(
-    target: torch.Tensor,
-    index: list[object],
-    value: torch.Tensor | float,
-    sem: str = "relaxed",
-) -> None:
-    """
-    Atomically add a value to a target tensor.
-
-    Performs an atomic read-modify-write operation that adds value to target[index].
-    This is safe for concurrent access from multiple threads/blocks.
-
-    Args:
-        target: The tensor to add to
-        index: Indices into target for accumulating values
-        value: The value to add (tensor or scalar)
-        sem: Memory ordering semantics (default: 'relaxed')
-            - 'relaxed': No ordering constraints
-            - 'acquire': Acquire semantics
-            - 'release': Release semantics
-            - 'acq_rel': Acquire-release semantics
-
-    Returns:
-        None
-
-    Examples:
-        .. code-block:: python
-
-            @helion.kernel
-            def global_sum(x: torch.Tensor, result: torch.Tensor) -> torch.Tensor:
-                # Each tile computes local sum, then atomically adds to global
-                for tile in hl.tile(x.size(0)):
-                    local_data = x[tile]
-                    local_sum = local_data.sum()
-                    hl.atomic_add(result, [0], local_sum)
-
-                return result
-
-    See Also:
-        - :func:`~helion.language.store`: For non-atomic stores
-        - :func:`~helion.language.load`: For atomic loads
-
-    Note:
-        - Required for race-free accumulation across parallel execution
-        - Performance depends on memory access patterns and contention
-        - Consider using regular operations when atomicity isn't needed
-        - Higher memory semantics (acquire/release) have performance overhead
-    """
-    raise exc.NotInsideKernel
-
-
-@_decorators.prepare_args(atomic_add)
-def _(
-    target: torch.Tensor,
-    index: list[object],
-    value: torch.Tensor | float,
-    sem: str = "relaxed",
-) -> tuple[torch.Tensor, object, torch.Tensor | float | int, str]:
-    from .tile_proxy import Tile
-
-    valid_sems = {"relaxed", "acquire", "release", "acq_rel"}
-    if sem not in valid_sems:
-        raise ValueError(
-            f"Invalid memory semantic '{sem}'. Must be one of {valid_sems}."
-        )
-
-    index = Tile._prepare_index(index)
-    index = Tile._tiles_to_sizes(index)
-
-    return (target, index, value, sem)
-
-
-@_decorators.register_fake(atomic_add)
-def _(
-    target: torch.Tensor, index: list[object], value: torch.Tensor, sem: str = "relaxed"
-) -> None:
-    return None
-
-
-@_decorators.ref(atomic_add)
-def _(
-    target: torch.Tensor,
-    index: list[object],
-    value: torch.Tensor | float,
-    sem: str = "relaxed",
-) -> None:
-    """Reference implementation of atomic_add for interpret mode."""
-    from .. import exc
-    from .ref_tile import RefTile
-
-    # Validate sem parameter
-    if sem not in ["relaxed", "acquire", "release", "acq_rel"]:
-        raise exc.InternalError(
-            ValueError(
-                f"Invalid memory semantic '{sem}'. Valid options are: relaxed, acquire, release, acq_rel"
-            )
-        )
-
-    # Convert indices to proper format
-    processed_index = []
-    for idx in index:
-        if isinstance(idx, RefTile):
-            processed_index.append(idx._slice)
-        elif isinstance(idx, torch.Tensor) and idx.numel() == 1:
-            processed_index.append(int(idx.item()))
-        else:
-            processed_index.append(idx)
-
-    # Find tensor indices that need element-wise processing
-    tensor_indices = [
-        (i, idx)
-        for i, idx in enumerate(processed_index)
-        if isinstance(idx, torch.Tensor) and idx.numel() > 1
-    ]
-
-    if tensor_indices:
-        # Element-wise processing for tensor indices
-        i, tensor_idx = tensor_indices[0]  # Handle first tensor index
-        for j, elem in enumerate(tensor_idx):
-            new_index = processed_index.copy()
-            new_index[i] = int(elem.item())
-            val = (
-                value[j]
-                if isinstance(value, torch.Tensor) and value.numel() > 1
-                else value
-            )
-            target[tuple(new_index)] += val
-    else:
-        # Direct atomic add
-        target[tuple(processed_index)] += value
-
-
-@_decorators.codegen(atomic_add)
-def _(state: CodegenState) -> ast.AST:
-    target = state.proxy_arg(0)
-    index = state.proxy_arg(1)
-    sem = expr_from_string(repr(state.proxy_arg(3)))
-
-    assert isinstance(target, torch.Tensor)
-    assert isinstance(index, list)
-
-    indices = SubscriptIndexing.create(state, target, index)
-    name = state.device_function.tensor_arg(target).name
-
-    value_expr = state.ast_args[2]
-    if isinstance(value_expr, (int, float, bool)):
-        value_expr = expr_from_string(constant_repr(value_expr))
-    assert isinstance(value_expr, ast.AST)
-    return expr_from_string(
-        f"tl.atomic_add({name} + offset, value, mask=mask, sem=sem)",
-        value=value_expr,
-        offset=indices.index_expr,
-        mask=indices.mask_expr,
-        sem=sem,
-    )

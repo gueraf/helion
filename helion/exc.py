@@ -48,6 +48,14 @@ class ClosuresNotSupported(BaseError):
     message = "A closure ({0!r}) was found in the kernel. Closures are not supported."
 
 
+class AutotuneError(BaseError):
+    message = "{0}"
+
+
+class CacheAssertionError(BaseError):
+    message = "Expected cache hit for kernel '{0}', but got cache miss. See stderr for diagnostic information."
+
+
 class ClosureMutation(BaseError):
     message = "Closure mutation (of {0}) is not allowed in a function arg."
 
@@ -105,6 +113,35 @@ class RankMismatch(BaseError):
 
 class InvalidIndexingType(BaseError):
     message = "Expected tile/int/None/tensor/etc in tensor[...], got {0!s}."
+
+
+class DotBatchDimensionMismatch(BaseError):
+    message = (
+        "hl.dot requires matching batch dimensions (or broadcasting with 1s), "
+        "but got {lhs} from LHS tensor vs. {rhs} from RHS tensor."
+    )
+
+
+class IndexOffsetOutOfRangeForInt32(BaseError):
+    message = (
+        "Kernel index_dtype is {0}, but tensor indexing offsets exceed the int32 range. "
+        "Use @helion.kernel(index_dtype=torch.int64) to enable larger offsets."
+    )
+
+
+class DataDependentOutputShapeNotSupported(BaseError):
+    message = (
+        "{op_desc} is not supported in Helion device loops because it produces "
+        "a data-dependent output shape."
+    )
+
+
+class UnsupportedSplitOperation(BaseError):
+    message = (
+        "{op} is not supported in Helion device loops. "
+        "For splitting the last dimension with size 2, use hl.split(). "
+        "For other splitting operations, consider reshaping or using other hl.* operations."
+    )
 
 
 class RequiresTensorInAssignment(BaseError):
@@ -193,6 +230,13 @@ class OverpackedTile(BaseError):
     )
 
 
+class InvalidTileRange(BaseError):
+    message = (
+        "hl.tile() expects the begin of the range to be less than or equal to the end. "
+        "Got begin={0!s}, end={1!s}."
+    )
+
+
 class AssignmentMultipleTargets(NotAllowedOnDevice):
     message = "Assignment with multiple targets (a=b=1) is not allowed inside the `hl.tile` or `hl.grid` loop."
 
@@ -221,6 +265,10 @@ class CantReadOnDevice(BaseError):
     message = "Cannot read {0!s} inside the `hl.tile` or `hl.grid` loop."
 
 
+class BreakpointInDeviceLoopRequiresInterpret(BaseError):
+    message = "breakpoint() inside an `hl.tile` or `hl.grid` loop requires TRITON_INTERPRET=1 or HELION_INTERPRET=1."
+
+
 class UndefinedVariable(BaseError):
     message = "{} is not defined."
 
@@ -235,6 +283,10 @@ class StarredArgsNotSupportedOnDevice(BaseError):
 
 class IncorrectTileUsage(BaseError):
     message = "Tiles can only be used in tensor indexing (`x[tile]`) or in `hl.*` ops (e.g. `hl.zeros(tile)`), used in {}"
+
+
+class TileOfTile(BaseError):
+    message = "Expected size arg to `hl.tile` got `Tile`, consider using `hl.tile(other_tile.begin, other_tile.end)`."
 
 
 class TracedArgNotSupported(BaseError):
@@ -305,7 +357,23 @@ class TorchOpTracingError(_WrapException):
 
 
 class TritonError(BaseError):
-    message = "Error running generated Triton program:\n{1}\n{0}"
+    message = """\
+Error from Triton code:
+{code}
+
+Error running generated Triton program:
+{error}
+{decorator}
+Set autotune_ignore_errors=True or HELION_AUTOTUNE_IGNORE_ERRORS=1 to ignore Triton errors in autotuning."""
+
+
+class TritonUnrecoverableRuntimeError(BaseError):
+    message = """\
+An unrecoverable Triton runtime error occurred: {reason}.
+This likely indicates a bug in Triton and cannot be recovered from.
+{decorator}
+Original error: {error}
+Set HELION_AUTOTUNE_PRECOMPILE="spawn" to isolate these errors in a subprocess so tuning can continue."""
 
 
 class BaseWarning(_FixedMessage):
@@ -335,6 +403,10 @@ class WrongDevice(BaseWarning):
     message = "Operation {0} returned a tensor on {1} device, but the kernel is on {2} device."
 
 
+class BlockSizeIgnoredInInterpretMode(BaseWarning):
+    message = "block_size is specified to be {0}, but in interpret mode, the full dimension size is always used."
+
+
 class AutotuningDisallowedInEnvironment(BaseError):
     message = "Autotuning is disabled {0}, please provide a config to @helion.kernel via the config= argument."
 
@@ -359,7 +431,14 @@ class NotAllowedInHelperFunction(BaseError):
 
 
 class CannotModifyHostVariableOnDevice(BaseError):
-    message = "Cannot modify host variable '{0}' inside `hl.tile` or `hl.grid` loop without subscript assignment. Use '{0}[tile] = ...' instead."
+    message = "Cannot modify host variable '{0}' inside `hl.tile` or `hl.grid` loop without subscript assignment. Use '{0}[tile] = ...' or '{0}[:] = ...' instead."
+
+
+class AtomicOnDeviceTensor(BaseError):
+    message = (
+        "hl.{0}() target must be host-allocated tensor (i.e. allocated outside of hl.tile or hl.grid loop). "
+        "Tensors created inside device loops do not have an addressable pointer for atomics."
+    )
 
 
 class CannotReadDeviceVariableOnHost(BaseError):
@@ -380,3 +459,23 @@ class InvalidAPIUsage(BaseError):
 
 class GraphModuleUnsupportedOps(BaseError):
     message = "GraphModule contains unsupported operations: {0}. Only pure computation graphs are supported (no load_attr or call_module ops)."
+
+
+class RefEagerModeCodePrintError(BaseError):
+    message = "No generated code to print out if ref eager mode is enabled."
+
+
+class NoDeviceLoopsInKernel(BaseError):
+    message = (
+        "Kernel contains no device loops. Add an hl.tile(...) or hl.grid(...) loop "
+        "around your device computations."
+    )
+
+
+class NestedKernelCallsNotSupported(BaseError):
+    message = (
+        "Calling a Helion kernel from within another Helion kernel is not supported. "
+        "Helion kernels can only be called from outside of @helion.kernel functions. "
+        "If you need to share code between kernels, consider extracting the shared logic "
+        "into a regular Python function that can be called from within both kernels."
+    )

@@ -35,7 +35,9 @@ class FiniteSearch(BaseSearch):
     def _autotune(self) -> Config:
         best_config = None
         best_time = float("inf")
-        for config, time in self.parallel_benchmark(self.configs):
+        for config, _fn, time, _status in self.parallel_benchmark(
+            self.configs, desc="Benchmarking"
+        ):
             if time < best_time:
                 best_time = time
                 best_config = config

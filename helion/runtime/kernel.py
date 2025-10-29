@@ -13,6 +13,7 @@ import types
 from typing import TYPE_CHECKING
 from typing import Callable
 from typing import Generic
+from typing import Hashable
 from typing import TypeVar
 from typing import cast
 from typing import overload
@@ -37,6 +38,7 @@ from .._compiler.output_header import assert_no_conflicts
 from .._compiler.output_header import get_needed_imports
 from .._compiler.variable_origin import ArgumentOrigin
 from .._logging import LazyString
+from .._utils import counters
 from ..language.constexpr import ConstExpr
 from .config import Config
 from .ref_mode import RefModeContext
@@ -69,6 +71,7 @@ class Kernel(Generic[_R]):
         *,
         configs: list[ConfigLike] | None = None,
         settings: Settings | None,
+        key: Callable[..., Hashable] | None = None,
     ) -> None:
         """
         Initialize the Kernel object.  This is typically called from the `@helion.kernel` decorator.
@@ -76,7 +79,8 @@ class Kernel(Generic[_R]):
         Args:
             fn: The function to be compiled as a Helion kernel.
             configs: A list of configurations to use for the kernel.
-            settings: The settings to be used by the Kernel. If None, default settings are used.
+            settings: The settings to be used by the Kernel. If None, a new `Settings()` instance is created.
+            key: Optional callable that returns an extra hashable component for specialization.
         """
         super().__init__()
         assert isinstance(fn, types.FunctionType)
@@ -84,7 +88,8 @@ class Kernel(Generic[_R]):
         self.name: str = fn.__name__
         self.fn: types.FunctionType = fn
         self.signature: inspect.Signature = inspect.signature(fn)
-        self.settings: Settings = settings or Settings.default()
+        self.settings: Settings = settings or Settings()
+        self._key_fn: Callable[..., Hashable] | None = key
         self.configs: list[Config] = [
             Config(**c) if isinstance(c, dict) else c  # pyright: ignore[reportArgumentType]
             for c in configs or []
@@ -150,6 +155,10 @@ class Kernel(Generic[_R]):
         if not isinstance(args, tuple):
             assert isinstance(args, list), "args must be a tuple or list"
             args = tuple(args)
+        if len(args) > len(self.signature.parameters):
+            raise TypeError(
+                f"Too many arguments passed to the kernel, expected: {len(self.signature.parameters)} got: {len(args)}."
+            )
         signature = self.specialization_key(args)
         cache_key = self._get_bound_kernel_cache_key(args, signature)
         bound_kernel = (
@@ -191,7 +200,9 @@ class Kernel(Generic[_R]):
                 result.append(value)
             else:
                 result.append(self._specialization_key(value))
-        return tuple(result)
+        if self._key_fn is not None:
+            return (*result, self._key_fn(*args))
+        return (*result,)
 
     def _specialization_key(self, obj: object) -> Hashable:
         """
@@ -242,7 +253,7 @@ class Kernel(Generic[_R]):
         self,
         args: Sequence[object],
         *,
-        force: bool = False,
+        force: bool = True,
         **options: object,
     ) -> Config:
         """
@@ -257,7 +268,7 @@ class Kernel(Generic[_R]):
         Args:
             args: Example arguments used for benchmarking during autotuning.
             force: If True, force full autotuning even if a config is provided.
-            **options: Additional options for autotuning.
+            options: Additional keyword options forwarded to the autotuner.
 
         Returns:
             Config: The best configuration found during autotuning.
@@ -378,12 +389,23 @@ class BoundKernel(Generic[_R]):
         """
         return self.kernel.configs
 
-    def to_triton_code(self, config: ConfigLike | None = None) -> str:
+    def format_kernel_decorator(self, config: Config, settings: Settings) -> str:
+        """Return the @helion.kernel decorator snippet capturing configs and settings that influence Triton code generation."""
+        return f"@helion.kernel(config={config.__repr__()}, static_shapes={settings.static_shapes})"
+
+    def to_triton_code(
+        self,
+        config: ConfigLike | None = None,
+        *,
+        emit_repro_caller: bool = False,
+        output_origin_lines: bool | None = None,
+    ) -> str:
         """
         Generate Triton code for the kernel based on the given configuration.
 
         Args:
             config: The configuration to use for code generation.
+            emit_repro_caller: Emits a main function to call the triton kernel with example inputs.
 
         Returns:
             str: The generated Triton code as a string.
@@ -394,8 +416,12 @@ class BoundKernel(Generic[_R]):
             if not isinstance(config, Config):
                 config = Config(**config)  # pyright: ignore[reportArgumentType]
             self.env.config_spec.normalize(config)
-            root = generate_ast(self.host_function, config)
-            return get_needed_imports(root) + unparse(root)
+            root = generate_ast(self.host_function, config, emit_repro_caller)
+            if output_origin_lines is None:
+                output_origin_lines = self.settings.output_origin_lines
+            return get_needed_imports(root) + unparse(
+                root, output_origin_lines=output_origin_lines
+            )
 
     def compile_config(
         self, config: ConfigLike | None = None, *, allow_print: bool = True
@@ -418,13 +444,24 @@ class BoundKernel(Generic[_R]):
             )
         if (rv := self._compile_cache.get(config)) is not None:
             return rv
-        triton_code = self.to_triton_code(config)
+        try:
+            triton_code = self.to_triton_code(
+                config, emit_repro_caller=self.settings.print_output_code
+            )
+            module = PyCodeCache.load(triton_code)
+        except Exception:
+            log.warning(
+                "Helion compiler triton codegen error for %s",
+                self.format_kernel_decorator(config, self.settings),
+                exc_info=True,
+            )
+            raise
         if allow_print:
             log.info("Output code: \n%s", triton_code)
+            log.info("Output code written to: %s", module.__file__)
             log.debug("Debug string: \n%s", LazyString(lambda: self._debug_str()))
             if self.settings.print_output_code:
                 print(triton_code, file=sys.stderr)
-        module = PyCodeCache.load(triton_code)
         rv = getattr(module, self.kernel.name)
         self._compile_cache[config] = rv
         return rv
@@ -446,7 +483,7 @@ class BoundKernel(Generic[_R]):
         self,
         args: Sequence[object],
         *,
-        force: bool = False,
+        force: bool = True,
         **kwargs: object,
     ) -> Config:
         """
@@ -461,7 +498,7 @@ class BoundKernel(Generic[_R]):
         Args:
             args: Example arguments used for benchmarking during autotuning.
             force: If True, force full autotuning even if a config is provided.
-            **kwargs: Additional options for autotuning.
+            kwargs: Additional keyword options forwarded to the autotuner.
 
         Returns:
             Config: The best configuration found during autotuning.
@@ -472,14 +509,16 @@ class BoundKernel(Generic[_R]):
                 (config,) = self.kernel.configs
             else:
                 # We have finite predetermined configs, no need to precompile
-                self.settings.autotune_precompile = False
+                self.settings.autotune_precompile = None
 
                 from ..autotuner import FiniteSearch
 
                 config = FiniteSearch(self, args, self.configs).autotune()
         else:
             self.settings.check_autotuning_disabled()
-            config = self.settings.autotuner_fn(self, args, **kwargs).autotune()
+            config = self.settings.autotuner_fn(self, args, **kwargs).autotune(
+                skip_cache=force
+            )
 
         self.set_config(config)
         return config
@@ -542,8 +581,15 @@ class BoundKernel(Generic[_R]):
             return self._config
         if len(configs) == 1:
             return configs[0]
-        if len(configs) == 0 and self.kernel.settings.use_default_config:
-            return self.config_spec.default_config()
+        if len(configs) == 0 and self.kernel.settings.autotune_effort == "none":
+            config = self.config_spec.default_config()
+            if not is_ref_mode_enabled(self.kernel.settings):
+                kernel_decorator = self.format_kernel_decorator(config, self.settings)
+                print(
+                    f"Using default config: {kernel_decorator}",
+                    file=sys.stderr,
+                )
+            return config
         return None
 
     def _require_implicit_config(self) -> Config:
@@ -587,8 +633,14 @@ class BoundKernel(Generic[_R]):
             if (config := self._implicit_config()) is not None:
                 self.set_config(config)
             else:
-                self.autotune(args)
+                self.autotune(args, force=False)
             assert self._run is not None
+
+        assert self._config is not None
+        counters["best_config_decorator"][
+            self.format_kernel_decorator(self._config, self.settings)
+        ] = 1
+
         return self._run(*args)
 
 
@@ -605,6 +657,7 @@ def kernel(
     *,
     config: ConfigLike | None = None,
     configs: list[ConfigLike] | None = None,
+    key: Callable[..., Hashable] | None = None,
     **settings: object,
 ) -> Kernel[_R]: ...
 
@@ -615,6 +668,7 @@ def kernel(
     *,
     config: ConfigLike | None = None,
     configs: list[ConfigLike] | None = None,
+    key: Callable[..., Hashable] | None = None,
     **settings: object,
 ) -> _KernelDecorator: ...
 
@@ -624,6 +678,7 @@ def kernel(
     *,
     config: ConfigLike | None = None,
     configs: list[ConfigLike] | None = None,
+    key: Callable[..., Hashable] | None = None,
     **settings: object,
 ) -> Kernel[_R] | _KernelDecorator:
     """
@@ -631,12 +686,16 @@ def kernel(
 
     Args:
         fn: The function to be wrapped by the Kernel. If None, a decorator is returned.
-        config: A single configuration to use for the kernel. See :class:`~helion.Config` for details.
-        configs: A list of configurations to use for the kernel.  Can only specify one of config or configs.
-                See :class:`~helion.Config` for details.
+        config: A single configuration to use for the kernel. Refer to the
+            ``helion.Config`` class for details.
+        configs: A list of configurations to use for the kernel. Can only specify
+            one of config or configs. Refer to the ``helion.Config`` class for
+            details.
+        key: Optional callable returning a hashable that augments the specialization key.
         settings: Keyword arguments representing settings for the Kernel.
-                 Can also use settings=Settings(...) to pass a Settings object directly.
-                 See :class:`~helion.Settings` for available options.
+            Can also use settings=Settings(...) to pass a Settings object
+            directly. Refer to the ``helion.Settings`` class for available
+            options.
 
     Returns:
         object: A Kernel object or a decorator that returns a Kernel object.
@@ -658,8 +717,10 @@ def kernel(
         settings_obj = Settings(**settings)
 
     if fn is None:
-        return functools.partial(kernel, configs=configs, settings=settings_obj)
-    return Kernel(fn, configs=configs, settings=settings_obj)
+        return functools.partial(
+            kernel, configs=configs, settings=settings_obj, key=key
+        )
+    return Kernel(fn, configs=configs, settings=settings_obj, key=key)
 
 
 def _tensor_key(fn: Kernel, obj: torch.Tensor) -> Hashable:
@@ -747,6 +808,7 @@ _specialization_extractors: dict[
     types.BuiltinFunctionType: lambda fn, x: x,
     torch.fx.GraphModule: _graph_module_key,
     ConstExpr: lambda fn, x: x.value,  # pyright: ignore[reportAttributeAccessIssue]
+    type(None): lambda fn, x: None,
 }
 
 

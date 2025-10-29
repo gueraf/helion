@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import functools
 import itertools
 import operator
@@ -13,16 +14,23 @@ from .config_fragment import ConfigSpecFragment
 from .config_fragment import PowerOfTwoFragment
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from .. import Config
     from . import ConfigSpec
 
 FlatConfig = list[object]
 
 
+TRITON_MAX_TENSOR_NUMEL = 1048576
+
+
 class ConfigGeneration:
     def __init__(
         self,
         config_spec: ConfigSpec,
+        *,
+        overrides: Mapping[str, object] | None = None,
     ) -> None:
         def _collect_spec(spec: ConfigSpecFragment) -> object:
             """
@@ -42,6 +50,7 @@ class ConfigGeneration:
         self.flat_spec: list[ConfigSpecFragment] = []
         config_spec.flat_config(_collect_spec)
         assert self.flat_spec, "No config values to tune"
+        self._override_values = dict(overrides or {})
         self.block_size_indices: list[int] = [
             i
             for i, spec in enumerate(self.flat_spec)
@@ -57,6 +66,14 @@ class ConfigGeneration:
             if config_spec.block_sizes
             else 1
         )
+
+    def _apply_overrides(self, config: Config) -> Config:
+        if not self._override_values:
+            return config
+        for key, value in self._override_values.items():
+            config.config[key] = copy.deepcopy(value)
+        self.config_spec.normalize(config.config)
+        return config
 
     def unflatten(self, flat_values: FlatConfig) -> Config:
         """
@@ -78,7 +95,7 @@ class ConfigGeneration:
         count: itertools.count[int] = itertools.count()
         config = self.config_spec.flat_config(get_next_value)
         assert next(count) == len(flat_values)
-        return config
+        return self._apply_overrides(config)
 
     def block_numel(self, flat_config: FlatConfig) -> int:
         return functools.reduce(
@@ -99,13 +116,17 @@ class ConfigGeneration:
             max_elements_per_thread: maximum number of elements per thread
         """
         num_threads = warps_to_threads(cast("int", flat_config[self.num_warps_index]))
-        max_elements = max_elements_per_thread * num_threads
+        # Respect Triton's maximum tensor element limit
+        triton_limit = TRITON_MAX_TENSOR_NUMEL
+        theoretical_max_elements = max_elements_per_thread * num_threads
+        max_elements = min(theoretical_max_elements, triton_limit)
         while self.block_numel(flat_config) > max_elements:
             changes = 0
             for i in self.block_size_indices:
                 val = flat_config[i]
                 assert isinstance(val, int)
-                if val > self.min_block_size:
+                threshold = max(self.flat_spec[i].get_minimum(), self.min_block_size)
+                if val // 2 >= threshold:
                     flat_config[i] = val // 2
                     changes += 1
             if changes == 0:

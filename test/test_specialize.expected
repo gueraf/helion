@@ -10,25 +10,36 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_fn(x, out, x_size_0, out_stride_0, out_stride_1, x_stride_0, x_stride_1, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
+def _helion_fn(x, out, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
+    # src[test_specialize.py:N]: for tile in hl.tile(x.size(0)):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
-    mask_0 = indices_0 < x_size_0
+    mask_0 = indices_0 < 500
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < 500
+    # src[test_specialize.py:N]: acc = hl.zeros([tile, helion.next_power_of_2(x.size(1))])
     acc = tl.full([_BLOCK_SIZE_0, 512], 0.0, tl.float32)
-    load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
+    # src[test_specialize.py:N]: acc += x[tile, :] + 1
+    load = tl.load(x + (indices_0[:, None] * 500 + indices_1[None, :] * 1), mask_0[:, None] & mask_1[None, :], other=0)
     v_0 = 1.0
     v_1 = load + v_0
     v_2 = acc + v_1
-    tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), v_2, mask_0[:, None] & mask_1[None, :])
+    # src[test_specialize.py:N]: out[tile, :] = acc
+    tl.store(out + (indices_0[:, None] * 500 + indices_1[None, :] * 1), v_2, mask_0[:, None] & mask_1[None, :])
 
 def fn(x: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_specialize.py:N]: out = torch.empty_like(x)
     out = torch.empty_like(x)
+    # src[test_specialize.py:N]: for tile in hl.tile(x.size(0)):
     _BLOCK_SIZE_0 = 32
     _RDIM_SIZE_1 = 512
-    _launcher(_helion_fn, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, out, x.size(0), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    # src[test_specialize.py:N]: for tile in hl.tile(x.size(0)):
+    # src[test_specialize.py:N]:     acc = hl.zeros([tile, helion.next_power_of_2(x.size(1))])
+    # src[test_specialize.py:N]:     acc += x[tile, :] + 1
+    # src[test_specialize.py:N-N]: ...
+    _launcher(_helion_fn, (triton.cdiv(500, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=1)
+    # src[test_specialize.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestSpecialize.test_dynamic_size_block_non_power_of_two_double_acc)
@@ -40,27 +51,40 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_fn(x, out, x_size_0, out_stride_0, out_stride_1, x_stride_0, x_stride_1, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
+def _helion_fn(x, out, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
+    # src[test_specialize.py:N]: for tile in hl.tile(x.size(0)):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
-    mask_0 = indices_0 < x_size_0
+    mask_0 = indices_0 < 500
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < 500
+    # src[test_specialize.py:N]: acc = hl.zeros([tile, helion.next_power_of_2(x.size(1))])
     acc = tl.full([_BLOCK_SIZE_0, 512], 0.0, tl.float32)
+    # src[test_specialize.py:N]: acc2 = hl.full([tile, helion.next_power_of_2(x.size(1))], 1.0)
     acc2 = tl.full([_BLOCK_SIZE_0, 512], 1.0, tl.float32)
+    # src[test_specialize.py:N]: acc = acc + acc2
     v_0 = acc + acc2
-    load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
+    # src[test_specialize.py:N]: acc = x[tile, :] + acc + 1
+    load = tl.load(x + (indices_0[:, None] * 500 + indices_1[None, :] * 1), mask_0[:, None] & mask_1[None, :], other=0)
     v_1 = load + v_0
     v_2 = 1.0
     v_3 = v_1 + v_2
-    tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), v_3, mask_0[:, None] & mask_1[None, :])
+    # src[test_specialize.py:N]: out[tile, :] = acc
+    tl.store(out + (indices_0[:, None] * 500 + indices_1[None, :] * 1), v_3, mask_0[:, None] & mask_1[None, :])
 
 def fn(x: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_specialize.py:N]: out = torch.empty_like(x)
     out = torch.empty_like(x)
+    # src[test_specialize.py:N]: for tile in hl.tile(x.size(0)):
     _BLOCK_SIZE_0 = 32
     _RDIM_SIZE_1 = 512
-    _launcher(_helion_fn, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, out, x.size(0), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    # src[test_specialize.py:N]: for tile in hl.tile(x.size(0)):
+    # src[test_specialize.py:N]:     acc = hl.zeros([tile, helion.next_power_of_2(x.size(1))])
+    # src[test_specialize.py:N]:     acc2 = hl.full([tile, helion.next_power_of_2(x.size(1))], 1.0)
+    # src[test_specialize.py:N-N]: ...
+    _launcher(_helion_fn, (triton.cdiv(500, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=1)
+    # src[test_specialize.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestSpecialize.test_dynamic_size_block_non_power_of_two_matmul)
@@ -72,28 +96,47 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_fn(x, out, x_size_0, out_stride_0, out_stride_1, x_stride_0, x_stride_1, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
+def _helion_fn(x, out, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
+    # src[test_specialize.py:N]: for tile in hl.tile(x.size(0)):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
-    mask_0 = indices_0 < x_size_0
+    mask_0 = indices_0 < 500
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < 500
+    # src[test_specialize.py:N]: acc = hl.full(
+    # src[test_specialize.py:N]:     [tile, helion.next_power_of_2(x.size(1))],
+    # src[test_specialize.py:N]:     1.0 / helion.next_power_of_2(x.size(1)),
+    # src[test_specialize.py:N-N]: ...
     acc = tl.full([_BLOCK_SIZE_0, 512], 0.001953125, tl.float32)
+    # src[test_specialize.py:N]: acc2 = hl.full(
+    # src[test_specialize.py:N]:     [
+    # src[test_specialize.py:N]:         helion.next_power_of_2(x.size(1)),
+    # src[test_specialize.py:N-N]: ...
     acc2 = tl.full([512, 512], 1.0, tl.float32)
-    _mask_to = tl.where(tl.broadcast_to(mask_0[:, None], [_BLOCK_SIZE_0, 512]), acc, 0)
-    acc_1 = tl.dot(_mask_to, acc2, input_precision='tf32')
-    load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
+    # src[test_specialize.py:N]: acc = torch.matmul(acc, acc2)
+    _mask_to = tl.where(tl.broadcast_to(mask_0[:, None], [_BLOCK_SIZE_0, 512]), acc, tl.full([], 0, tl.float32))
+    acc_1 = tl.dot(tl.cast(_mask_to, tl.float32), tl.cast(acc2, tl.float32), input_precision='tf32', out_dtype=tl.float32)
+    # src[test_specialize.py:N]: acc = x[tile, :] + acc + 1
+    load = tl.load(x + (indices_0[:, None] * 500 + indices_1[None, :] * 1), mask_0[:, None] & mask_1[None, :], other=0)
     v_0 = load + acc_1
     v_1 = 1.0
     v_2 = v_0 + v_1
-    tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), v_2, mask_0[:, None] & mask_1[None, :])
+    # src[test_specialize.py:N]: out[tile, :] = acc
+    tl.store(out + (indices_0[:, None] * 500 + indices_1[None, :] * 1), v_2, mask_0[:, None] & mask_1[None, :])
 
 def fn(x: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_specialize.py:N]: out = torch.empty_like(x)
     out = torch.empty_like(x)
+    # src[test_specialize.py:N]: for tile in hl.tile(x.size(0)):
     _BLOCK_SIZE_0 = 32
     _RDIM_SIZE_1 = 512
-    _launcher(_helion_fn, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, out, x.size(0), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    # src[test_specialize.py:N]: for tile in hl.tile(x.size(0)):
+    # src[test_specialize.py:N]:     acc = hl.full(
+    # src[test_specialize.py:N]:         [tile, helion.next_power_of_2(x.size(1))],
+    # src[test_specialize.py:N-N]: ...
+    _launcher(_helion_fn, (triton.cdiv(500, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=1)
+    # src[test_specialize.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestSpecialize.test_dynamic_size_block_non_power_of_two_outplace)
@@ -105,25 +148,36 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_fn(x, out, x_size_0, out_stride_0, out_stride_1, x_stride_0, x_stride_1, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
+def _helion_fn(x, out, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
+    # src[test_specialize.py:N]: for tile in hl.tile(x.size(0)):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
-    mask_0 = indices_0 < x_size_0
+    mask_0 = indices_0 < 500
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < 500
+    # src[test_specialize.py:N]: acc = hl.zeros([tile, helion.next_power_of_2(x.size(1))])
     acc = tl.full([_BLOCK_SIZE_0, 512], 0.0, tl.float32)
-    load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
+    # src[test_specialize.py:N]: acc = acc + x[tile, :] + 1
+    load = tl.load(x + (indices_0[:, None] * 500 + indices_1[None, :] * 1), mask_0[:, None] & mask_1[None, :], other=0)
     v_0 = acc + load
     v_1 = 1.0
     v_2 = v_0 + v_1
-    tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), v_2, mask_0[:, None] & mask_1[None, :])
+    # src[test_specialize.py:N]: out[tile, :] = acc
+    tl.store(out + (indices_0[:, None] * 500 + indices_1[None, :] * 1), v_2, mask_0[:, None] & mask_1[None, :])
 
 def fn(x: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_specialize.py:N]: out = torch.empty_like(x)
     out = torch.empty_like(x)
+    # src[test_specialize.py:N]: for tile in hl.tile(x.size(0)):
     _BLOCK_SIZE_0 = 32
     _RDIM_SIZE_1 = 512
-    _launcher(_helion_fn, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, out, x.size(0), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    # src[test_specialize.py:N]: for tile in hl.tile(x.size(0)):
+    # src[test_specialize.py:N]:     acc = hl.zeros([tile, helion.next_power_of_2(x.size(1))])
+    # src[test_specialize.py:N]:     acc = acc + x[tile, :] + 1
+    # src[test_specialize.py:N-N]: ...
+    _launcher(_helion_fn, (triton.cdiv(500, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=1)
+    # src[test_specialize.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestSpecialize.test_dynamic_size_block_non_power_of_two_swap_order)
@@ -135,25 +189,36 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_fn(x, out, x_size_0, out_stride_0, out_stride_1, x_stride_0, x_stride_1, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
+def _helion_fn(x, out, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
+    # src[test_specialize.py:N]: for tile in hl.tile(x.size(0)):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
-    mask_0 = indices_0 < x_size_0
+    mask_0 = indices_0 < 500
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < 500
+    # src[test_specialize.py:N]: acc = hl.zeros([tile, helion.next_power_of_2(x.size(1))])
     acc = tl.full([_BLOCK_SIZE_0, 512], 0.0, tl.float32)
-    load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
+    # src[test_specialize.py:N]: acc = x[tile, :] + acc + 1
+    load = tl.load(x + (indices_0[:, None] * 500 + indices_1[None, :] * 1), mask_0[:, None] & mask_1[None, :], other=0)
     v_0 = load + acc
     v_1 = 1.0
     v_2 = v_0 + v_1
-    tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), v_2, mask_0[:, None] & mask_1[None, :])
+    # src[test_specialize.py:N]: out[tile, :] = acc
+    tl.store(out + (indices_0[:, None] * 500 + indices_1[None, :] * 1), v_2, mask_0[:, None] & mask_1[None, :])
 
 def fn(x: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_specialize.py:N]: out = torch.empty_like(x)
     out = torch.empty_like(x)
+    # src[test_specialize.py:N]: for tile in hl.tile(x.size(0)):
     _BLOCK_SIZE_0 = 32
     _RDIM_SIZE_1 = 512
-    _launcher(_helion_fn, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, out, x.size(0), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    # src[test_specialize.py:N]: for tile in hl.tile(x.size(0)):
+    # src[test_specialize.py:N]:     acc = hl.zeros([tile, helion.next_power_of_2(x.size(1))])
+    # src[test_specialize.py:N]:     acc = x[tile, :] + acc + 1
+    # src[test_specialize.py:N-N]: ...
+    _launcher(_helion_fn, (triton.cdiv(500, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=1)
+    # src[test_specialize.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestSpecialize.test_dynamic_size_block_specialize)
@@ -165,24 +230,34 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_fn(x, out, x_size_0, out_stride_0, out_stride_1, x_stride_0, x_stride_1, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
+def _helion_fn(x, out, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
+    # src[test_specialize.py:N]: for tile in hl.tile(x.size(0)):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
-    mask_0 = indices_0 < x_size_0
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
+    # src[test_specialize.py:N]: acc = hl.zeros([tile, x.size(1)])
     acc = tl.full([_BLOCK_SIZE_0, 512], 0.0, tl.float32)
-    load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None], other=0)
+    # src[test_specialize.py:N]: acc += x[tile, :] + 1
+    load = tl.load(x + (indices_0[:, None] * 512 + indices_1[None, :] * 1), None)
     v_0 = 1.0
     v_1 = load + v_0
     v_2 = acc + v_1
-    tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), v_2, mask_0[:, None])
+    # src[test_specialize.py:N]: out[tile, :] = acc
+    tl.store(out + (indices_0[:, None] * 512 + indices_1[None, :] * 1), v_2, None)
 
 def fn(x: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_specialize.py:N]: out = torch.empty_like(x)
     out = torch.empty_like(x)
+    # src[test_specialize.py:N]: for tile in hl.tile(x.size(0)):
     _BLOCK_SIZE_0 = 32
     _RDIM_SIZE_1 = 512
-    _launcher(_helion_fn, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, out, x.size(0), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    # src[test_specialize.py:N]: for tile in hl.tile(x.size(0)):
+    # src[test_specialize.py:N]:     acc = hl.zeros([tile, x.size(1)])
+    # src[test_specialize.py:N]:     acc += x[tile, :] + 1
+    # src[test_specialize.py:N-N]: ...
+    _launcher(_helion_fn, (triton.cdiv(512, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=1)
+    # src[test_specialize.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestSpecialize.test_specialize_host)
@@ -195,27 +270,35 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_fn(x, out, x_size_0, out_stride_0, out_stride_1, x_stride_0, x_stride_1, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
-    num_blocks_0 = tl.cdiv(x_size_0, _BLOCK_SIZE_0)
+def _helion_fn(x, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+    # src[test_specialize.py:N]: for tile in hl.tile(x.size()):
+    num_blocks_0 = tl.cdiv(500, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
-    mask_0 = indices_0 < x_size_0
+    mask_0 = indices_0 < 500
     offset_1 = pid_1 * _BLOCK_SIZE_1
     indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
     mask_1 = indices_1 < 500
-    load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
+    # src[test_specialize.py:N]: out[tile] = x[tile] * scale
+    load = tl.load(x + (indices_0[:, None] * 500 + indices_1[None, :] * 1), mask_0[:, None] & mask_1[None, :], other=0)
     v_0 = 0.044721359549995794
     v_1 = load * v_0
-    tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), v_1, mask_0[:, None] & mask_1[None, :])
+    tl.store(out + (indices_0[:, None] * 500 + indices_1[None, :] * 1), v_1, mask_0[:, None] & mask_1[None, :])
 
 def fn(x: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_specialize.py:N]: scale = 1.0 / math.sqrt(x.size(-1))
     scale = 1.0 / math.sqrt(x.size(-1))
+    # src[test_specialize.py:N]: out = torch.empty_like(x)
     out = torch.empty_like(x)
+    # src[test_specialize.py:N]: for tile in hl.tile(x.size()):
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 32
-    _launcher(_helion_fn, (triton.cdiv(x.size(0), _BLOCK_SIZE_0) * triton.cdiv(x.size(1), _BLOCK_SIZE_1),), x, out, x.size(0), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    # src[test_specialize.py:N]: for tile in hl.tile(x.size()):
+    # src[test_specialize.py:N]:     out[tile] = x[tile] * scale
+    _launcher(_helion_fn, (triton.cdiv(500, _BLOCK_SIZE_0) * triton.cdiv(500, _BLOCK_SIZE_1),), x, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
+    # src[test_specialize.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestSpecialize.test_specialize_reduce)
@@ -227,22 +310,29 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_fn(x, out, x_size_0, out_stride_0, x_stride_0, x_stride_1, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
+def _helion_fn(x, out, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
+    # src[test_specialize.py:N]: for tile in hl.tile(x.size(0)):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
-    mask_0 = indices_0 < x_size_0
+    mask_0 = indices_0 < 500
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < 500
-    load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
-    sum_1 = tl.sum(load, 1)
-    tl.store(out + indices_0 * out_stride_0, sum_1, mask_0)
+    # src[test_specialize.py:N]: out[tile] = x[tile, :].sum(-1)
+    load = tl.load(x + (indices_0[:, None] * 500 + indices_1[None, :] * 1), mask_0[:, None] & mask_1[None, :], other=0)
+    sum_1 = tl.cast(tl.sum(load, 1), tl.float32)
+    tl.store(out + indices_0 * 1, sum_1, mask_0)
 
 def fn(x: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_specialize.py:N]: out = x.new_empty([x.size(0)])
     out = x.new_empty([x.size(0)])
+    # src[test_specialize.py:N]: for tile in hl.tile(x.size(0)):
     _BLOCK_SIZE_0 = 32
     _RDIM_SIZE_1 = 512
-    _launcher(_helion_fn, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, out, x.size(0), out.stride(0), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    # src[test_specialize.py:N]: for tile in hl.tile(x.size(0)):
+    # src[test_specialize.py:N]:     out[tile] = x[tile, :].sum(-1)
+    _launcher(_helion_fn, (triton.cdiv(500, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=1)
+    # src[test_specialize.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestSpecialize.test_sqrt_does_not_specialize)
@@ -255,18 +345,758 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_fn(x, out, x_size_0, x_size_1, out_stride_0, out_stride_1, x_stride_0, x_stride_1, scale, _BLOCK_SIZE_0_1: tl.constexpr):
+def _helion_fn(x, out, _BLOCK_SIZE_0_1: tl.constexpr):
+    # src[test_specialize.py:N]: for tile in hl.tile(x.size()):
     offsets_0_1 = tl.program_id(0) * _BLOCK_SIZE_0_1 + tl.arange(0, _BLOCK_SIZE_0_1).to(tl.int32)
-    indices_1 = offsets_0_1 % x_size_1
-    indices_0 = offsets_0_1 // x_size_1
-    mask_0_1 = offsets_0_1 < x_size_0 * x_size_1
-    load = tl.load(x + (indices_0 * x_stride_0 + indices_1 * x_stride_1), mask_0_1, other=0)
-    v_0 = load * scale
-    tl.store(out + (indices_0 * out_stride_0 + indices_1 * out_stride_1), v_0, mask_0_1)
+    indices_1 = offsets_0_1 % 512
+    indices_0 = offsets_0_1 // 512
+    # src[test_specialize.py:N]: out[tile] = x[tile] * scale
+    load = tl.load(x + (indices_0 * 512 + indices_1 * 1), None)
+    v_0 = 0.044194173824159216
+    v_1 = load * v_0
+    tl.store(out + (indices_0 * 512 + indices_1 * 1), v_1, None)
 
 def fn(x: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_specialize.py:N]: scale = 1.0 / math.sqrt(x.size(-1))
     scale = 1.0 / math.sqrt(x.size(-1))
+    # src[test_specialize.py:N]: out = torch.empty_like(x)
     out = torch.empty_like(x)
+    # src[test_specialize.py:N]: for tile in hl.tile(x.size()):
     _BLOCK_SIZE_0_1 = 32
-    _launcher(_helion_fn, (triton.cdiv(x.size(0) * x.size(1), _BLOCK_SIZE_0_1), 1, 1), x, out, x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), scale, _BLOCK_SIZE_0_1, num_warps=4, num_stages=3)
+    # src[test_specialize.py:N]: for tile in hl.tile(x.size()):
+    # src[test_specialize.py:N]:     out[tile] = x[tile] * scale
+    _launcher(_helion_fn, (triton.cdiv(262144, _BLOCK_SIZE_0_1), 1, 1), x, out, _BLOCK_SIZE_0_1, num_warps=4, num_stages=1)
+    # src[test_specialize.py:N]: return out
     return out
+
+--- assertExpectedJournal(TestSpecialize.test_tensor_factory_specialize_non_power_of_2)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+import test.test_specialize as _source_module
+
+@triton.jit
+def _helion_reduce_kernel(x, grad_weight, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_2: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+    # src[test_specialize.py:N]: for mb_cta in hl.tile(x.size(0), block_size=m_block):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_3 = tl.arange(0, _RDIM_SIZE_2).to(tl.int32)
+    mask_2 = indices_3 < 56
+    # src[test_specialize.py:N]: grad_w_m = tensor_factory_fn(x, weight_shape, dtype=torch.float32)
+    grad_w_m = tl.full([64], 0, tl.float32)
+    # src[test_specialize.py:N]: grad_w_m = grad_w_m * grad_w_m.new_zeros(weight_shape)
+    full_1 = tl.full([64], 0, tl.float32)
+    v_0 = grad_w_m * full_1
+    # src[test_specialize.py:N]: for mb in hl.tile(mb_cta.begin, mb_cta.end):
+    tile_end = offset_0 + _BLOCK_SIZE_0
+    # src[test_specialize.py:N]: for mb in hl.tile(mb_cta.begin, mb_cta.end):
+    # src[test_specialize.py:N]:     grad_w_m += x[mb, :].to(torch.float32).sum(0)
+    for offset_2 in tl.range(offset_0.to(tl.int32), tile_end.to(tl.int32), _BLOCK_SIZE_1):
+        indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+        mask_1 = indices_2 < tile_end
+        v_0_copy = v_0
+        v_0_copy_0 = v_0_copy
+        # src[test_specialize.py:N]: grad_w_m += x[mb, :].to(torch.float32).sum(0)
+        load = tl.load(x + (indices_2[:, None] * 56 + indices_3[None, :] * 1), mask_1[:, None] & mask_2[None, :], other=0)
+        sum_1 = tl.cast(tl.sum(load, 0), tl.float32)
+        v_0 = v_0_copy_0 + sum_1
+    # src[test_specialize.py:N]: grad_weight[mb_cta.id, :] = grad_w_m
+    tile_id = offset_0 // _BLOCK_SIZE_0
+    tl.store(grad_weight + (tile_id * 56 + indices_3 * 1), v_0, mask_2)
+
+def reduce_kernel(x: torch.Tensor, tensor_factory_fn, test_host, *, _launcher=_default_launcher):
+    # src[test_specialize.py:N]: m_block = hl.register_block_size(x.size(0))
+    m_block = 32
+    # src[test_specialize.py:N]: grad_weight = x.new_empty(
+    # src[test_specialize.py:N]:     [(x.size(0) + m_block - 1) // m_block, x.size(1)],
+    # src[test_specialize.py:N]:     dtype=torch.float32,
+    # src[test_specialize.py:N-N]: ...
+    grad_weight = x.new_empty([(x.size(0) + m_block - 1) // m_block, x.size(1)], dtype=torch.float32)
+    # src[test_specialize.py:N]: weight_shape = hl.specialize(x.size(1))
+    weight_shape = 56
+    # src[test_specialize.py:N]: if test_host:
+    # src[test_specialize.py:N]:     # Host-side tensor creation should NOT be padded
+    # src[test_specialize.py:N]:     host_buffer = tensor_factory_fn(
+    # src[test_specialize.py:N-N]: ...
+    if test_host:
+        # src[test_specialize.py:N]: host_buffer = tensor_factory_fn(
+        # src[test_specialize.py:N]:     x, weight_shape, dtype=torch.float32
+        # src[test_specialize.py:N]: )
+        host_buffer = tensor_factory_fn(x, weight_shape, dtype=torch.float32)
+        # src[test_specialize.py:N]: assert host_buffer.size(0) == 56
+        assert host_buffer.size(0) == 56
+    # src[test_specialize.py:N]: for mb_cta in hl.tile(x.size(0), block_size=m_block):
+    _BLOCK_SIZE_0 = 32
+    _RDIM_SIZE_2 = 64
+    # src[test_specialize.py:N]: for mb in hl.tile(mb_cta.begin, mb_cta.end):
+    # src[test_specialize.py:N]:     grad_w_m += x[mb, :].to(torch.float32).sum(0)
+    _BLOCK_SIZE_1 = 32
+    # src[test_specialize.py:N]: for mb_cta in hl.tile(x.size(0), block_size=m_block):
+    # src[test_specialize.py:N]:     # Device-side tensor creation should be padded to 64
+    # src[test_specialize.py:N]:     grad_w_m = tensor_factory_fn(x, weight_shape, dtype=torch.float32)
+    # src[test_specialize.py:N-N]: ...
+    _launcher(_helion_reduce_kernel, (triton.cdiv(128, _BLOCK_SIZE_0),), x, grad_weight, _BLOCK_SIZE_0, _RDIM_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
+    # src[test_specialize.py:N]: return grad_weight.sum(0).to(x.dtype)
+    return grad_weight.sum(0).to(x.dtype)
+
+--- assertExpectedJournal(TestSpecialize.test_tensor_factory_specialize_non_power_of_2)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+import test.test_specialize as _source_module
+
+@triton.jit
+def _helion_reduce_kernel(x, grad_weight, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_2: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+    # src[test_specialize.py:N]: for mb_cta in hl.tile(x.size(0), block_size=m_block):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_3 = tl.arange(0, _RDIM_SIZE_2).to(tl.int32)
+    mask_2 = indices_3 < 56
+    # src[test_specialize.py:N]: grad_w_m = tensor_factory_fn(x, weight_shape, dtype=torch.float32)
+    grad_w_m = tl.full([64], 1, tl.float32)
+    # src[test_specialize.py:N]: grad_w_m = grad_w_m * grad_w_m.new_zeros(weight_shape)
+    full_1 = tl.full([64], 0, tl.float32)
+    v_0 = grad_w_m * full_1
+    # src[test_specialize.py:N]: for mb in hl.tile(mb_cta.begin, mb_cta.end):
+    tile_end = offset_0 + _BLOCK_SIZE_0
+    # src[test_specialize.py:N]: for mb in hl.tile(mb_cta.begin, mb_cta.end):
+    # src[test_specialize.py:N]:     grad_w_m += x[mb, :].to(torch.float32).sum(0)
+    for offset_2 in tl.range(offset_0.to(tl.int32), tile_end.to(tl.int32), _BLOCK_SIZE_1):
+        indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+        mask_1 = indices_2 < tile_end
+        v_0_copy = v_0
+        v_0_copy_0 = v_0_copy
+        # src[test_specialize.py:N]: grad_w_m += x[mb, :].to(torch.float32).sum(0)
+        load = tl.load(x + (indices_2[:, None] * 56 + indices_3[None, :] * 1), mask_1[:, None] & mask_2[None, :], other=0)
+        sum_1 = tl.cast(tl.sum(load, 0), tl.float32)
+        v_0 = v_0_copy_0 + sum_1
+    # src[test_specialize.py:N]: grad_weight[mb_cta.id, :] = grad_w_m
+    tile_id = offset_0 // _BLOCK_SIZE_0
+    tl.store(grad_weight + (tile_id * 56 + indices_3 * 1), v_0, mask_2)
+
+def reduce_kernel(x: torch.Tensor, tensor_factory_fn, test_host, *, _launcher=_default_launcher):
+    # src[test_specialize.py:N]: m_block = hl.register_block_size(x.size(0))
+    m_block = 32
+    # src[test_specialize.py:N]: grad_weight = x.new_empty(
+    # src[test_specialize.py:N]:     [(x.size(0) + m_block - 1) // m_block, x.size(1)],
+    # src[test_specialize.py:N]:     dtype=torch.float32,
+    # src[test_specialize.py:N-N]: ...
+    grad_weight = x.new_empty([(x.size(0) + m_block - 1) // m_block, x.size(1)], dtype=torch.float32)
+    # src[test_specialize.py:N]: weight_shape = hl.specialize(x.size(1))
+    weight_shape = 56
+    # src[test_specialize.py:N]: if test_host:
+    # src[test_specialize.py:N]:     # Host-side tensor creation should NOT be padded
+    # src[test_specialize.py:N]:     host_buffer = tensor_factory_fn(
+    # src[test_specialize.py:N-N]: ...
+    if test_host:
+        # src[test_specialize.py:N]: host_buffer = tensor_factory_fn(
+        # src[test_specialize.py:N]:     x, weight_shape, dtype=torch.float32
+        # src[test_specialize.py:N]: )
+        host_buffer = tensor_factory_fn(x, weight_shape, dtype=torch.float32)
+        # src[test_specialize.py:N]: assert host_buffer.size(0) == 56
+        assert host_buffer.size(0) == 56
+    # src[test_specialize.py:N]: for mb_cta in hl.tile(x.size(0), block_size=m_block):
+    _BLOCK_SIZE_0 = 32
+    _RDIM_SIZE_2 = 64
+    # src[test_specialize.py:N]: for mb in hl.tile(mb_cta.begin, mb_cta.end):
+    # src[test_specialize.py:N]:     grad_w_m += x[mb, :].to(torch.float32).sum(0)
+    _BLOCK_SIZE_1 = 32
+    # src[test_specialize.py:N]: for mb_cta in hl.tile(x.size(0), block_size=m_block):
+    # src[test_specialize.py:N]:     # Device-side tensor creation should be padded to 64
+    # src[test_specialize.py:N]:     grad_w_m = tensor_factory_fn(x, weight_shape, dtype=torch.float32)
+    # src[test_specialize.py:N-N]: ...
+    _launcher(_helion_reduce_kernel, (triton.cdiv(128, _BLOCK_SIZE_0),), x, grad_weight, _BLOCK_SIZE_0, _RDIM_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
+    # src[test_specialize.py:N]: return grad_weight.sum(0).to(x.dtype)
+    return grad_weight.sum(0).to(x.dtype)
+
+--- assertExpectedJournal(TestSpecialize.test_tensor_factory_specialize_non_power_of_2)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+import test.test_specialize as _source_module
+
+@triton.jit
+def _helion_reduce_kernel(x, grad_weight, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_2: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+    # src[test_specialize.py:N]: for mb_cta in hl.tile(x.size(0), block_size=m_block):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_3 = tl.arange(0, _RDIM_SIZE_2).to(tl.int32)
+    mask_2 = indices_3 < 56
+    # src[test_specialize.py:N]: grad_w_m = tensor_factory_fn(x, weight_shape, dtype=torch.float32)
+    v_0 = 0.0
+    # src[test_specialize.py:N]: grad_w_m = grad_w_m * grad_w_m.new_zeros(weight_shape)
+    full = tl.full([64], 0, tl.float32)
+    v_1 = v_0 * full
+    # src[test_specialize.py:N]: for mb in hl.tile(mb_cta.begin, mb_cta.end):
+    tile_end = offset_0 + _BLOCK_SIZE_0
+    # src[test_specialize.py:N]: for mb in hl.tile(mb_cta.begin, mb_cta.end):
+    # src[test_specialize.py:N]:     grad_w_m += x[mb, :].to(torch.float32).sum(0)
+    for offset_2 in tl.range(offset_0.to(tl.int32), tile_end.to(tl.int32), _BLOCK_SIZE_1):
+        indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+        mask_1 = indices_2 < tile_end
+        v_1_copy = v_1
+        v_1_copy_0 = v_1_copy
+        # src[test_specialize.py:N]: grad_w_m += x[mb, :].to(torch.float32).sum(0)
+        load = tl.load(x + (indices_2[:, None] * 56 + indices_3[None, :] * 1), mask_1[:, None] & mask_2[None, :], other=0)
+        sum_1 = tl.cast(tl.sum(load, 0), tl.float32)
+        v_1 = v_1_copy_0 + sum_1
+    # src[test_specialize.py:N]: grad_weight[mb_cta.id, :] = grad_w_m
+    tile_id = offset_0 // _BLOCK_SIZE_0
+    tl.store(grad_weight + (tile_id * 56 + indices_3 * 1), v_1, mask_2)
+
+def reduce_kernel(x: torch.Tensor, tensor_factory_fn, test_host, *, _launcher=_default_launcher):
+    # src[test_specialize.py:N]: m_block = hl.register_block_size(x.size(0))
+    m_block = 32
+    # src[test_specialize.py:N]: grad_weight = x.new_empty(
+    # src[test_specialize.py:N]:     [(x.size(0) + m_block - 1) // m_block, x.size(1)],
+    # src[test_specialize.py:N]:     dtype=torch.float32,
+    # src[test_specialize.py:N-N]: ...
+    grad_weight = x.new_empty([(x.size(0) + m_block - 1) // m_block, x.size(1)], dtype=torch.float32)
+    # src[test_specialize.py:N]: weight_shape = hl.specialize(x.size(1))
+    weight_shape = 56
+    # src[test_specialize.py:N]: if test_host:
+    # src[test_specialize.py:N]:     # Host-side tensor creation should NOT be padded
+    # src[test_specialize.py:N]:     host_buffer = tensor_factory_fn(
+    # src[test_specialize.py:N-N]: ...
+    if test_host:
+        # src[test_specialize.py:N]: host_buffer = tensor_factory_fn(
+        # src[test_specialize.py:N]:     x, weight_shape, dtype=torch.float32
+        # src[test_specialize.py:N]: )
+        host_buffer = tensor_factory_fn(x, weight_shape, dtype=torch.float32)
+        # src[test_specialize.py:N]: assert host_buffer.size(0) == 56
+        assert host_buffer.size(0) == 56
+    # src[test_specialize.py:N]: for mb_cta in hl.tile(x.size(0), block_size=m_block):
+    _BLOCK_SIZE_0 = 32
+    _RDIM_SIZE_2 = 64
+    # src[test_specialize.py:N]: for mb in hl.tile(mb_cta.begin, mb_cta.end):
+    # src[test_specialize.py:N]:     grad_w_m += x[mb, :].to(torch.float32).sum(0)
+    _BLOCK_SIZE_1 = 32
+    # src[test_specialize.py:N]: for mb_cta in hl.tile(x.size(0), block_size=m_block):
+    # src[test_specialize.py:N]:     # Device-side tensor creation should be padded to 64
+    # src[test_specialize.py:N]:     grad_w_m = tensor_factory_fn(x, weight_shape, dtype=torch.float32)
+    # src[test_specialize.py:N-N]: ...
+    _launcher(_helion_reduce_kernel, (triton.cdiv(128, _BLOCK_SIZE_0),), x, grad_weight, _BLOCK_SIZE_0, _RDIM_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
+    # src[test_specialize.py:N]: return grad_weight.sum(0).to(x.dtype)
+    return grad_weight.sum(0).to(x.dtype)
+
+--- assertExpectedJournal(TestSpecialize.test_tensor_factory_specialize_non_power_of_2)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+import test.test_specialize as _source_module
+
+@triton.jit
+def _helion_reduce_kernel(x, grad_weight, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_2: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+    # src[test_specialize.py:N]: for mb_cta in hl.tile(x.size(0), block_size=m_block):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_3 = tl.arange(0, _RDIM_SIZE_2).to(tl.int32)
+    mask_2 = indices_3 < 56
+    # src[test_specialize.py:N]: grad_w_m = tensor_factory_fn(x, weight_shape, dtype=torch.float32)
+    grad_w_m = tl.full([64], 1.0, tl.float32)
+    # src[test_specialize.py:N]: grad_w_m = grad_w_m * grad_w_m.new_zeros(weight_shape)
+    full_1 = tl.full([64], 0, tl.float32)
+    v_0 = grad_w_m * full_1
+    # src[test_specialize.py:N]: for mb in hl.tile(mb_cta.begin, mb_cta.end):
+    tile_end = offset_0 + _BLOCK_SIZE_0
+    # src[test_specialize.py:N]: for mb in hl.tile(mb_cta.begin, mb_cta.end):
+    # src[test_specialize.py:N]:     grad_w_m += x[mb, :].to(torch.float32).sum(0)
+    for offset_2 in tl.range(offset_0.to(tl.int32), tile_end.to(tl.int32), _BLOCK_SIZE_1):
+        indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+        mask_1 = indices_2 < tile_end
+        v_0_copy = v_0
+        v_0_copy_0 = v_0_copy
+        # src[test_specialize.py:N]: grad_w_m += x[mb, :].to(torch.float32).sum(0)
+        load = tl.load(x + (indices_2[:, None] * 56 + indices_3[None, :] * 1), mask_1[:, None] & mask_2[None, :], other=0)
+        sum_1 = tl.cast(tl.sum(load, 0), tl.float32)
+        v_0 = v_0_copy_0 + sum_1
+    # src[test_specialize.py:N]: grad_weight[mb_cta.id, :] = grad_w_m
+    tile_id = offset_0 // _BLOCK_SIZE_0
+    tl.store(grad_weight + (tile_id * 56 + indices_3 * 1), v_0, mask_2)
+
+def reduce_kernel(x: torch.Tensor, tensor_factory_fn, test_host, *, _launcher=_default_launcher):
+    # src[test_specialize.py:N]: m_block = hl.register_block_size(x.size(0))
+    m_block = 32
+    # src[test_specialize.py:N]: grad_weight = x.new_empty(
+    # src[test_specialize.py:N]:     [(x.size(0) + m_block - 1) // m_block, x.size(1)],
+    # src[test_specialize.py:N]:     dtype=torch.float32,
+    # src[test_specialize.py:N-N]: ...
+    grad_weight = x.new_empty([(x.size(0) + m_block - 1) // m_block, x.size(1)], dtype=torch.float32)
+    # src[test_specialize.py:N]: weight_shape = hl.specialize(x.size(1))
+    weight_shape = 56
+    # src[test_specialize.py:N]: if test_host:
+    # src[test_specialize.py:N]:     # Host-side tensor creation should NOT be padded
+    # src[test_specialize.py:N]:     host_buffer = tensor_factory_fn(
+    # src[test_specialize.py:N-N]: ...
+    if test_host:
+        # src[test_specialize.py:N]: host_buffer = tensor_factory_fn(
+        # src[test_specialize.py:N]:     x, weight_shape, dtype=torch.float32
+        # src[test_specialize.py:N]: )
+        host_buffer = tensor_factory_fn(x, weight_shape, dtype=torch.float32)
+        # src[test_specialize.py:N]: assert host_buffer.size(0) == 56
+        assert host_buffer.size(0) == 56
+    # src[test_specialize.py:N]: for mb_cta in hl.tile(x.size(0), block_size=m_block):
+    _BLOCK_SIZE_0 = 32
+    _RDIM_SIZE_2 = 64
+    # src[test_specialize.py:N]: for mb in hl.tile(mb_cta.begin, mb_cta.end):
+    # src[test_specialize.py:N]:     grad_w_m += x[mb, :].to(torch.float32).sum(0)
+    _BLOCK_SIZE_1 = 32
+    # src[test_specialize.py:N]: for mb_cta in hl.tile(x.size(0), block_size=m_block):
+    # src[test_specialize.py:N]:     # Device-side tensor creation should be padded to 64
+    # src[test_specialize.py:N]:     grad_w_m = tensor_factory_fn(x, weight_shape, dtype=torch.float32)
+    # src[test_specialize.py:N-N]: ...
+    _launcher(_helion_reduce_kernel, (triton.cdiv(128, _BLOCK_SIZE_0),), x, grad_weight, _BLOCK_SIZE_0, _RDIM_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
+    # src[test_specialize.py:N]: return grad_weight.sum(0).to(x.dtype)
+    return grad_weight.sum(0).to(x.dtype)
+
+--- assertExpectedJournal(TestSpecialize.test_tensor_factory_specialize_non_power_of_2)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_reduce_kernel(x, grad_weight, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_2: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+    # src[test_specialize.py:N]: for mb_cta in hl.tile(x.size(0), block_size=m_block):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_3 = tl.arange(0, _RDIM_SIZE_2).to(tl.int32)
+    mask_2 = indices_3 < 56
+    # src[test_specialize.py:N]: grad_w_m = tensor_factory_fn(x, weight_shape, dtype=torch.float32)
+    grad_w_m = tl.full([64], 0, tl.float32)
+    # src[test_specialize.py:N]: grad_w_m = grad_w_m * grad_w_m.new_zeros(weight_shape)
+    full_1 = tl.full([64], 0, tl.float32)
+    v_0 = grad_w_m * full_1
+    # src[test_specialize.py:N]: for mb in hl.tile(mb_cta.begin, mb_cta.end):
+    tile_end = offset_0 + _BLOCK_SIZE_0
+    # src[test_specialize.py:N]: for mb in hl.tile(mb_cta.begin, mb_cta.end):
+    # src[test_specialize.py:N]:     grad_w_m += x[mb, :].to(torch.float32).sum(0)
+    for offset_2 in tl.range(offset_0.to(tl.int32), tile_end.to(tl.int32), _BLOCK_SIZE_1):
+        indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+        mask_1 = indices_2 < tile_end
+        v_0_copy = v_0
+        v_0_copy_0 = v_0_copy
+        # src[test_specialize.py:N]: grad_w_m += x[mb, :].to(torch.float32).sum(0)
+        load = tl.load(x + (indices_2[:, None] * 56 + indices_3[None, :] * 1), mask_1[:, None] & mask_2[None, :], other=0)
+        sum_1 = tl.cast(tl.sum(load, 0), tl.float32)
+        v_0 = v_0_copy_0 + sum_1
+    # src[test_specialize.py:N]: grad_weight[mb_cta.id, :] = grad_w_m
+    tile_id = offset_0 // _BLOCK_SIZE_0
+    tl.store(grad_weight + (tile_id * 56 + indices_3 * 1), v_0, mask_2)
+
+def reduce_kernel(x: torch.Tensor, tensor_factory_fn, test_host, *, _launcher=_default_launcher):
+    # src[test_specialize.py:N]: m_block = hl.register_block_size(x.size(0))
+    m_block = 32
+    # src[test_specialize.py:N]: grad_weight = x.new_empty(
+    # src[test_specialize.py:N]:     [(x.size(0) + m_block - 1) // m_block, x.size(1)],
+    # src[test_specialize.py:N]:     dtype=torch.float32,
+    # src[test_specialize.py:N-N]: ...
+    grad_weight = x.new_empty([(x.size(0) + m_block - 1) // m_block, x.size(1)], dtype=torch.float32)
+    # src[test_specialize.py:N]: weight_shape = hl.specialize(x.size(1))
+    weight_shape = 56
+    # src[test_specialize.py:N]: if test_host:
+    # src[test_specialize.py:N]:     # Host-side tensor creation should NOT be padded
+    # src[test_specialize.py:N]:     host_buffer = tensor_factory_fn(
+    # src[test_specialize.py:N-N]: ...
+    if test_host:
+        # src[test_specialize.py:N]: host_buffer = tensor_factory_fn(
+        # src[test_specialize.py:N]:     x, weight_shape, dtype=torch.float32
+        # src[test_specialize.py:N]: )
+        host_buffer = tensor_factory_fn(x, weight_shape, dtype=torch.float32)
+        # src[test_specialize.py:N]: assert host_buffer.size(0) == 56
+        assert host_buffer.size(0) == 56
+    # src[test_specialize.py:N]: for mb_cta in hl.tile(x.size(0), block_size=m_block):
+    _BLOCK_SIZE_0 = 32
+    _RDIM_SIZE_2 = 64
+    # src[test_specialize.py:N]: for mb in hl.tile(mb_cta.begin, mb_cta.end):
+    # src[test_specialize.py:N]:     grad_w_m += x[mb, :].to(torch.float32).sum(0)
+    _BLOCK_SIZE_1 = 32
+    # src[test_specialize.py:N]: for mb_cta in hl.tile(x.size(0), block_size=m_block):
+    # src[test_specialize.py:N]:     # Device-side tensor creation should be padded to 64
+    # src[test_specialize.py:N]:     grad_w_m = tensor_factory_fn(x, weight_shape, dtype=torch.float32)
+    # src[test_specialize.py:N-N]: ...
+    _launcher(_helion_reduce_kernel, (triton.cdiv(128, _BLOCK_SIZE_0),), x, grad_weight, _BLOCK_SIZE_0, _RDIM_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
+    # src[test_specialize.py:N]: return grad_weight.sum(0).to(x.dtype)
+    return grad_weight.sum(0).to(x.dtype)
+
+--- assertExpectedJournal(TestSpecialize.test_tensor_factory_specialize_non_power_of_2)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_reduce_kernel(x, grad_weight, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_2: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+    # src[test_specialize.py:N]: for mb_cta in hl.tile(x.size(0), block_size=m_block):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_3 = tl.arange(0, _RDIM_SIZE_2).to(tl.int32)
+    mask_2 = indices_3 < 56
+    # src[test_specialize.py:N]: grad_w_m = tensor_factory_fn(x, weight_shape, dtype=torch.float32)
+    grad_w_m = tl.full([64], 1, tl.float32)
+    # src[test_specialize.py:N]: grad_w_m = grad_w_m * grad_w_m.new_zeros(weight_shape)
+    full_1 = tl.full([64], 0, tl.float32)
+    v_0 = grad_w_m * full_1
+    # src[test_specialize.py:N]: for mb in hl.tile(mb_cta.begin, mb_cta.end):
+    tile_end = offset_0 + _BLOCK_SIZE_0
+    # src[test_specialize.py:N]: for mb in hl.tile(mb_cta.begin, mb_cta.end):
+    # src[test_specialize.py:N]:     grad_w_m += x[mb, :].to(torch.float32).sum(0)
+    for offset_2 in tl.range(offset_0.to(tl.int32), tile_end.to(tl.int32), _BLOCK_SIZE_1):
+        indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+        mask_1 = indices_2 < tile_end
+        v_0_copy = v_0
+        v_0_copy_0 = v_0_copy
+        # src[test_specialize.py:N]: grad_w_m += x[mb, :].to(torch.float32).sum(0)
+        load = tl.load(x + (indices_2[:, None] * 56 + indices_3[None, :] * 1), mask_1[:, None] & mask_2[None, :], other=0)
+        sum_1 = tl.cast(tl.sum(load, 0), tl.float32)
+        v_0 = v_0_copy_0 + sum_1
+    # src[test_specialize.py:N]: grad_weight[mb_cta.id, :] = grad_w_m
+    tile_id = offset_0 // _BLOCK_SIZE_0
+    tl.store(grad_weight + (tile_id * 56 + indices_3 * 1), v_0, mask_2)
+
+def reduce_kernel(x: torch.Tensor, tensor_factory_fn, test_host, *, _launcher=_default_launcher):
+    # src[test_specialize.py:N]: m_block = hl.register_block_size(x.size(0))
+    m_block = 32
+    # src[test_specialize.py:N]: grad_weight = x.new_empty(
+    # src[test_specialize.py:N]:     [(x.size(0) + m_block - 1) // m_block, x.size(1)],
+    # src[test_specialize.py:N]:     dtype=torch.float32,
+    # src[test_specialize.py:N-N]: ...
+    grad_weight = x.new_empty([(x.size(0) + m_block - 1) // m_block, x.size(1)], dtype=torch.float32)
+    # src[test_specialize.py:N]: weight_shape = hl.specialize(x.size(1))
+    weight_shape = 56
+    # src[test_specialize.py:N]: if test_host:
+    # src[test_specialize.py:N]:     # Host-side tensor creation should NOT be padded
+    # src[test_specialize.py:N]:     host_buffer = tensor_factory_fn(
+    # src[test_specialize.py:N-N]: ...
+    if test_host:
+        # src[test_specialize.py:N]: host_buffer = tensor_factory_fn(
+        # src[test_specialize.py:N]:     x, weight_shape, dtype=torch.float32
+        # src[test_specialize.py:N]: )
+        host_buffer = tensor_factory_fn(x, weight_shape, dtype=torch.float32)
+        # src[test_specialize.py:N]: assert host_buffer.size(0) == 56
+        assert host_buffer.size(0) == 56
+    # src[test_specialize.py:N]: for mb_cta in hl.tile(x.size(0), block_size=m_block):
+    _BLOCK_SIZE_0 = 32
+    _RDIM_SIZE_2 = 64
+    # src[test_specialize.py:N]: for mb in hl.tile(mb_cta.begin, mb_cta.end):
+    # src[test_specialize.py:N]:     grad_w_m += x[mb, :].to(torch.float32).sum(0)
+    _BLOCK_SIZE_1 = 32
+    # src[test_specialize.py:N]: for mb_cta in hl.tile(x.size(0), block_size=m_block):
+    # src[test_specialize.py:N]:     # Device-side tensor creation should be padded to 64
+    # src[test_specialize.py:N]:     grad_w_m = tensor_factory_fn(x, weight_shape, dtype=torch.float32)
+    # src[test_specialize.py:N-N]: ...
+    _launcher(_helion_reduce_kernel, (triton.cdiv(128, _BLOCK_SIZE_0),), x, grad_weight, _BLOCK_SIZE_0, _RDIM_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
+    # src[test_specialize.py:N]: return grad_weight.sum(0).to(x.dtype)
+    return grad_weight.sum(0).to(x.dtype)
+
+--- assertExpectedJournal(TestSpecialize.test_tensor_factory_specialize_non_power_of_2)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_reduce_kernel(x, grad_weight, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_2: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+    # src[test_specialize.py:N]: for mb_cta in hl.tile(x.size(0), block_size=m_block):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_3 = tl.arange(0, _RDIM_SIZE_2).to(tl.int32)
+    mask_2 = indices_3 < 56
+    # src[test_specialize.py:N]: grad_w_m = tensor_factory_fn(x, weight_shape, dtype=torch.float32)
+    v_0 = 0.0
+    # src[test_specialize.py:N]: grad_w_m = grad_w_m * grad_w_m.new_zeros(weight_shape)
+    full = tl.full([64], 0, tl.float32)
+    v_1 = v_0 * full
+    # src[test_specialize.py:N]: for mb in hl.tile(mb_cta.begin, mb_cta.end):
+    tile_end = offset_0 + _BLOCK_SIZE_0
+    # src[test_specialize.py:N]: for mb in hl.tile(mb_cta.begin, mb_cta.end):
+    # src[test_specialize.py:N]:     grad_w_m += x[mb, :].to(torch.float32).sum(0)
+    for offset_2 in tl.range(offset_0.to(tl.int32), tile_end.to(tl.int32), _BLOCK_SIZE_1):
+        indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+        mask_1 = indices_2 < tile_end
+        v_1_copy = v_1
+        v_1_copy_0 = v_1_copy
+        # src[test_specialize.py:N]: grad_w_m += x[mb, :].to(torch.float32).sum(0)
+        load = tl.load(x + (indices_2[:, None] * 56 + indices_3[None, :] * 1), mask_1[:, None] & mask_2[None, :], other=0)
+        sum_1 = tl.cast(tl.sum(load, 0), tl.float32)
+        v_1 = v_1_copy_0 + sum_1
+    # src[test_specialize.py:N]: grad_weight[mb_cta.id, :] = grad_w_m
+    tile_id = offset_0 // _BLOCK_SIZE_0
+    tl.store(grad_weight + (tile_id * 56 + indices_3 * 1), v_1, mask_2)
+
+def reduce_kernel(x: torch.Tensor, tensor_factory_fn, test_host, *, _launcher=_default_launcher):
+    # src[test_specialize.py:N]: m_block = hl.register_block_size(x.size(0))
+    m_block = 32
+    # src[test_specialize.py:N]: grad_weight = x.new_empty(
+    # src[test_specialize.py:N]:     [(x.size(0) + m_block - 1) // m_block, x.size(1)],
+    # src[test_specialize.py:N]:     dtype=torch.float32,
+    # src[test_specialize.py:N-N]: ...
+    grad_weight = x.new_empty([(x.size(0) + m_block - 1) // m_block, x.size(1)], dtype=torch.float32)
+    # src[test_specialize.py:N]: weight_shape = hl.specialize(x.size(1))
+    weight_shape = 56
+    # src[test_specialize.py:N]: if test_host:
+    # src[test_specialize.py:N]:     # Host-side tensor creation should NOT be padded
+    # src[test_specialize.py:N]:     host_buffer = tensor_factory_fn(
+    # src[test_specialize.py:N-N]: ...
+    if test_host:
+        # src[test_specialize.py:N]: host_buffer = tensor_factory_fn(
+        # src[test_specialize.py:N]:     x, weight_shape, dtype=torch.float32
+        # src[test_specialize.py:N]: )
+        host_buffer = tensor_factory_fn(x, weight_shape, dtype=torch.float32)
+        # src[test_specialize.py:N]: assert host_buffer.size(0) == 56
+        assert host_buffer.size(0) == 56
+    # src[test_specialize.py:N]: for mb_cta in hl.tile(x.size(0), block_size=m_block):
+    _BLOCK_SIZE_0 = 32
+    _RDIM_SIZE_2 = 64
+    # src[test_specialize.py:N]: for mb in hl.tile(mb_cta.begin, mb_cta.end):
+    # src[test_specialize.py:N]:     grad_w_m += x[mb, :].to(torch.float32).sum(0)
+    _BLOCK_SIZE_1 = 32
+    # src[test_specialize.py:N]: for mb_cta in hl.tile(x.size(0), block_size=m_block):
+    # src[test_specialize.py:N]:     # Device-side tensor creation should be padded to 64
+    # src[test_specialize.py:N]:     grad_w_m = tensor_factory_fn(x, weight_shape, dtype=torch.float32)
+    # src[test_specialize.py:N-N]: ...
+    _launcher(_helion_reduce_kernel, (triton.cdiv(128, _BLOCK_SIZE_0),), x, grad_weight, _BLOCK_SIZE_0, _RDIM_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
+    # src[test_specialize.py:N]: return grad_weight.sum(0).to(x.dtype)
+    return grad_weight.sum(0).to(x.dtype)
+
+--- assertExpectedJournal(TestSpecialize.test_tensor_factory_specialize_non_power_of_2)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_reduce_kernel(x, grad_weight, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_2: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+    # src[test_specialize.py:N]: for mb_cta in hl.tile(x.size(0), block_size=m_block):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_3 = tl.arange(0, _RDIM_SIZE_2).to(tl.int32)
+    mask_2 = indices_3 < 56
+    # src[test_specialize.py:N]: grad_w_m = tensor_factory_fn(x, weight_shape, dtype=torch.float32)
+    grad_w_m = tl.full([64], 1.0, tl.float32)
+    # src[test_specialize.py:N]: grad_w_m = grad_w_m * grad_w_m.new_zeros(weight_shape)
+    full_1 = tl.full([64], 0, tl.float32)
+    v_0 = grad_w_m * full_1
+    # src[test_specialize.py:N]: for mb in hl.tile(mb_cta.begin, mb_cta.end):
+    tile_end = offset_0 + _BLOCK_SIZE_0
+    # src[test_specialize.py:N]: for mb in hl.tile(mb_cta.begin, mb_cta.end):
+    # src[test_specialize.py:N]:     grad_w_m += x[mb, :].to(torch.float32).sum(0)
+    for offset_2 in tl.range(offset_0.to(tl.int32), tile_end.to(tl.int32), _BLOCK_SIZE_1):
+        indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+        mask_1 = indices_2 < tile_end
+        v_0_copy = v_0
+        v_0_copy_0 = v_0_copy
+        # src[test_specialize.py:N]: grad_w_m += x[mb, :].to(torch.float32).sum(0)
+        load = tl.load(x + (indices_2[:, None] * 56 + indices_3[None, :] * 1), mask_1[:, None] & mask_2[None, :], other=0)
+        sum_1 = tl.cast(tl.sum(load, 0), tl.float32)
+        v_0 = v_0_copy_0 + sum_1
+    # src[test_specialize.py:N]: grad_weight[mb_cta.id, :] = grad_w_m
+    tile_id = offset_0 // _BLOCK_SIZE_0
+    tl.store(grad_weight + (tile_id * 56 + indices_3 * 1), v_0, mask_2)
+
+def reduce_kernel(x: torch.Tensor, tensor_factory_fn, test_host, *, _launcher=_default_launcher):
+    # src[test_specialize.py:N]: m_block = hl.register_block_size(x.size(0))
+    m_block = 32
+    # src[test_specialize.py:N]: grad_weight = x.new_empty(
+    # src[test_specialize.py:N]:     [(x.size(0) + m_block - 1) // m_block, x.size(1)],
+    # src[test_specialize.py:N]:     dtype=torch.float32,
+    # src[test_specialize.py:N-N]: ...
+    grad_weight = x.new_empty([(x.size(0) + m_block - 1) // m_block, x.size(1)], dtype=torch.float32)
+    # src[test_specialize.py:N]: weight_shape = hl.specialize(x.size(1))
+    weight_shape = 56
+    # src[test_specialize.py:N]: if test_host:
+    # src[test_specialize.py:N]:     # Host-side tensor creation should NOT be padded
+    # src[test_specialize.py:N]:     host_buffer = tensor_factory_fn(
+    # src[test_specialize.py:N-N]: ...
+    if test_host:
+        # src[test_specialize.py:N]: host_buffer = tensor_factory_fn(
+        # src[test_specialize.py:N]:     x, weight_shape, dtype=torch.float32
+        # src[test_specialize.py:N]: )
+        host_buffer = tensor_factory_fn(x, weight_shape, dtype=torch.float32)
+        # src[test_specialize.py:N]: assert host_buffer.size(0) == 56
+        assert host_buffer.size(0) == 56
+    # src[test_specialize.py:N]: for mb_cta in hl.tile(x.size(0), block_size=m_block):
+    _BLOCK_SIZE_0 = 32
+    _RDIM_SIZE_2 = 64
+    # src[test_specialize.py:N]: for mb in hl.tile(mb_cta.begin, mb_cta.end):
+    # src[test_specialize.py:N]:     grad_w_m += x[mb, :].to(torch.float32).sum(0)
+    _BLOCK_SIZE_1 = 32
+    # src[test_specialize.py:N]: for mb_cta in hl.tile(x.size(0), block_size=m_block):
+    # src[test_specialize.py:N]:     # Device-side tensor creation should be padded to 64
+    # src[test_specialize.py:N]:     grad_w_m = tensor_factory_fn(x, weight_shape, dtype=torch.float32)
+    # src[test_specialize.py:N-N]: ...
+    _launcher(_helion_reduce_kernel, (triton.cdiv(128, _BLOCK_SIZE_0),), x, grad_weight, _BLOCK_SIZE_0, _RDIM_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
+    # src[test_specialize.py:N]: return grad_weight.sum(0).to(x.dtype)
+    return grad_weight.sum(0).to(x.dtype)
+
+--- assertExpectedJournal(TestSpecialize.test_tensor_factory_specialize_non_power_of_2)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+import test.test_specialize as _source_module
+
+@triton.jit
+def _helion_reduce_kernel(x, grad_weight, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_2: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+    # src[test_specialize.py:N]: for mb_cta in hl.tile(x.size(0), block_size=m_block):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_3 = tl.arange(0, _RDIM_SIZE_2).to(tl.int32)
+    mask_2 = indices_3 < 56
+    # src[test_specialize.py:N]: grad_w_m = tensor_factory_fn(x, weight_shape, dtype=torch.float32)
+    grad_w_m = tl.full([64], 0.0, tl.float32)
+    # src[test_specialize.py:N]: grad_w_m = grad_w_m * grad_w_m.new_zeros(weight_shape)
+    full_1 = tl.full([64], 0, tl.float32)
+    v_0 = grad_w_m * full_1
+    # src[test_specialize.py:N]: for mb in hl.tile(mb_cta.begin, mb_cta.end):
+    tile_end = offset_0 + _BLOCK_SIZE_0
+    # src[test_specialize.py:N]: for mb in hl.tile(mb_cta.begin, mb_cta.end):
+    # src[test_specialize.py:N]:     grad_w_m += x[mb, :].to(torch.float32).sum(0)
+    for offset_2 in tl.range(offset_0.to(tl.int32), tile_end.to(tl.int32), _BLOCK_SIZE_1):
+        indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+        mask_1 = indices_2 < tile_end
+        v_0_copy = v_0
+        v_0_copy_0 = v_0_copy
+        # src[test_specialize.py:N]: grad_w_m += x[mb, :].to(torch.float32).sum(0)
+        load = tl.load(x + (indices_2[:, None] * 56 + indices_3[None, :] * 1), mask_1[:, None] & mask_2[None, :], other=0)
+        sum_1 = tl.cast(tl.sum(load, 0), tl.float32)
+        v_0 = v_0_copy_0 + sum_1
+    # src[test_specialize.py:N]: grad_weight[mb_cta.id, :] = grad_w_m
+    tile_id = offset_0 // _BLOCK_SIZE_0
+    tl.store(grad_weight + (tile_id * 56 + indices_3 * 1), v_0, mask_2)
+
+def reduce_kernel(x: torch.Tensor, tensor_factory_fn, test_host, *, _launcher=_default_launcher):
+    # src[test_specialize.py:N]: m_block = hl.register_block_size(x.size(0))
+    m_block = 32
+    # src[test_specialize.py:N]: grad_weight = x.new_empty(
+    # src[test_specialize.py:N]:     [(x.size(0) + m_block - 1) // m_block, x.size(1)],
+    # src[test_specialize.py:N]:     dtype=torch.float32,
+    # src[test_specialize.py:N-N]: ...
+    grad_weight = x.new_empty([(x.size(0) + m_block - 1) // m_block, x.size(1)], dtype=torch.float32)
+    # src[test_specialize.py:N]: weight_shape = hl.specialize(x.size(1))
+    weight_shape = 56
+    # src[test_specialize.py:N]: if test_host:
+    # src[test_specialize.py:N]:     # Host-side tensor creation should NOT be padded
+    # src[test_specialize.py:N]:     host_buffer = tensor_factory_fn(
+    # src[test_specialize.py:N-N]: ...
+    if test_host:
+        # src[test_specialize.py:N]: host_buffer = tensor_factory_fn(
+        # src[test_specialize.py:N]:     x, weight_shape, dtype=torch.float32
+        # src[test_specialize.py:N]: )
+        host_buffer = tensor_factory_fn(x, weight_shape, dtype=torch.float32)
+        # src[test_specialize.py:N]: assert host_buffer.size(0) == 56
+        assert host_buffer.size(0) == 56
+    # src[test_specialize.py:N]: for mb_cta in hl.tile(x.size(0), block_size=m_block):
+    _BLOCK_SIZE_0 = 32
+    _RDIM_SIZE_2 = 64
+    # src[test_specialize.py:N]: for mb in hl.tile(mb_cta.begin, mb_cta.end):
+    # src[test_specialize.py:N]:     grad_w_m += x[mb, :].to(torch.float32).sum(0)
+    _BLOCK_SIZE_1 = 32
+    # src[test_specialize.py:N]: for mb_cta in hl.tile(x.size(0), block_size=m_block):
+    # src[test_specialize.py:N]:     # Device-side tensor creation should be padded to 64
+    # src[test_specialize.py:N]:     grad_w_m = tensor_factory_fn(x, weight_shape, dtype=torch.float32)
+    # src[test_specialize.py:N-N]: ...
+    _launcher(_helion_reduce_kernel, (triton.cdiv(128, _BLOCK_SIZE_0),), x, grad_weight, _BLOCK_SIZE_0, _RDIM_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
+    # src[test_specialize.py:N]: return grad_weight.sum(0).to(x.dtype)
+    return grad_weight.sum(0).to(x.dtype)
+
+--- assertExpectedJournal(TestSpecialize.test_tensor_factory_specialize_non_power_of_2)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+import test.test_specialize as _source_module
+
+@triton.jit
+def _helion_reduce_kernel(x, grad_weight, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_2: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+    # src[test_specialize.py:N]: for mb_cta in hl.tile(x.size(0), block_size=m_block):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_3 = tl.arange(0, _RDIM_SIZE_2).to(tl.int32)
+    mask_2 = indices_3 < 56
+    # src[test_specialize.py:N]: grad_w_m = tensor_factory_fn(x, weight_shape, dtype=torch.float32)
+    grad_w_m = tl.full([64], 1.0, tl.float32)
+    # src[test_specialize.py:N]: grad_w_m = grad_w_m * grad_w_m.new_zeros(weight_shape)
+    full_1 = tl.full([64], 0, tl.float32)
+    v_0 = grad_w_m * full_1
+    # src[test_specialize.py:N]: for mb in hl.tile(mb_cta.begin, mb_cta.end):
+    tile_end = offset_0 + _BLOCK_SIZE_0
+    # src[test_specialize.py:N]: for mb in hl.tile(mb_cta.begin, mb_cta.end):
+    # src[test_specialize.py:N]:     grad_w_m += x[mb, :].to(torch.float32).sum(0)
+    for offset_2 in tl.range(offset_0.to(tl.int32), tile_end.to(tl.int32), _BLOCK_SIZE_1):
+        indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+        mask_1 = indices_2 < tile_end
+        v_0_copy = v_0
+        v_0_copy_0 = v_0_copy
+        # src[test_specialize.py:N]: grad_w_m += x[mb, :].to(torch.float32).sum(0)
+        load = tl.load(x + (indices_2[:, None] * 56 + indices_3[None, :] * 1), mask_1[:, None] & mask_2[None, :], other=0)
+        sum_1 = tl.cast(tl.sum(load, 0), tl.float32)
+        v_0 = v_0_copy_0 + sum_1
+    # src[test_specialize.py:N]: grad_weight[mb_cta.id, :] = grad_w_m
+    tile_id = offset_0 // _BLOCK_SIZE_0
+    tl.store(grad_weight + (tile_id * 56 + indices_3 * 1), v_0, mask_2)
+
+def reduce_kernel(x: torch.Tensor, tensor_factory_fn, test_host, *, _launcher=_default_launcher):
+    # src[test_specialize.py:N]: m_block = hl.register_block_size(x.size(0))
+    m_block = 32
+    # src[test_specialize.py:N]: grad_weight = x.new_empty(
+    # src[test_specialize.py:N]:     [(x.size(0) + m_block - 1) // m_block, x.size(1)],
+    # src[test_specialize.py:N]:     dtype=torch.float32,
+    # src[test_specialize.py:N-N]: ...
+    grad_weight = x.new_empty([(x.size(0) + m_block - 1) // m_block, x.size(1)], dtype=torch.float32)
+    # src[test_specialize.py:N]: weight_shape = hl.specialize(x.size(1))
+    weight_shape = 56
+    # src[test_specialize.py:N]: if test_host:
+    # src[test_specialize.py:N]:     # Host-side tensor creation should NOT be padded
+    # src[test_specialize.py:N]:     host_buffer = tensor_factory_fn(
+    # src[test_specialize.py:N-N]: ...
+    if test_host:
+        # src[test_specialize.py:N]: host_buffer = tensor_factory_fn(
+        # src[test_specialize.py:N]:     x, weight_shape, dtype=torch.float32
+        # src[test_specialize.py:N]: )
+        host_buffer = tensor_factory_fn(x, weight_shape, dtype=torch.float32)
+        # src[test_specialize.py:N]: assert host_buffer.size(0) == 56
+        assert host_buffer.size(0) == 56
+    # src[test_specialize.py:N]: for mb_cta in hl.tile(x.size(0), block_size=m_block):
+    _BLOCK_SIZE_0 = 32
+    _RDIM_SIZE_2 = 64
+    # src[test_specialize.py:N]: for mb in hl.tile(mb_cta.begin, mb_cta.end):
+    # src[test_specialize.py:N]:     grad_w_m += x[mb, :].to(torch.float32).sum(0)
+    _BLOCK_SIZE_1 = 32
+    # src[test_specialize.py:N]: for mb_cta in hl.tile(x.size(0), block_size=m_block):
+    # src[test_specialize.py:N]:     # Device-side tensor creation should be padded to 64
+    # src[test_specialize.py:N]:     grad_w_m = tensor_factory_fn(x, weight_shape, dtype=torch.float32)
+    # src[test_specialize.py:N-N]: ...
+    _launcher(_helion_reduce_kernel, (triton.cdiv(128, _BLOCK_SIZE_0),), x, grad_weight, _BLOCK_SIZE_0, _RDIM_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
+    # src[test_specialize.py:N]: return grad_weight.sum(0).to(x.dtype)
+    return grad_weight.sum(0).to(x.dtype)

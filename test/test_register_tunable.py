@@ -23,7 +23,7 @@ class TestRegisterTunable(RefEagerTestBase, TestCase):
     maxDiff = 10000
 
     def test_power_of_two_fragment_basic(self):
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def kernel_with_tunable(x: torch.Tensor) -> torch.Tensor:
             (n,) = x.size()
             out = torch.empty_like(x)
@@ -107,6 +107,7 @@ class TestRegisterTunable(RefEagerTestBase, TestCase):
         self.assertExpectedJournal(code)
         torch.testing.assert_close(result, x.sum())
 
+    @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfRocm("failure on rocm")
     def test_matmul_split_k(self):
         """Test matmul_split_k kernel with register_tunable"""

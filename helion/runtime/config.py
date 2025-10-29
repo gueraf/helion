@@ -14,6 +14,7 @@ from ..autotuner.config_spec import DEFAULT_NUM_WARPS
 
 IndexingLiteral = Literal["pointer", "tensor_descriptor", "block_ptr"]
 PidTypeLiteral = Literal["flat", "xyz", "persistent_blocked", "persistent_interleaved"]
+EvictionPolicyLiteral = Literal["", "first", "last"]
 
 
 class Config(Mapping[str, object]):
@@ -34,10 +35,11 @@ class Config(Mapping[str, object]):
         range_multi_buffers: list[bool | None] | None = None,
         range_flattens: list[bool | None] | None = None,
         static_ranges: list[bool] | None = None,
+        load_eviction_policies: list[EvictionPolicyLiteral] | None = None,
         num_warps: int | None = None,
         num_stages: int | None = None,
         pid_type: PidTypeLiteral | None = None,
-        indexing: IndexingLiteral | None = None,
+        indexing: IndexingLiteral | list[IndexingLiteral] | None = None,
         # For user-defined properties
         **kwargs: object,
     ) -> None:
@@ -55,10 +57,17 @@ class Config(Mapping[str, object]):
             range_multi_buffers: Controls disallow_acc_multi_buffer for tl.range calls.
             range_flattens: Controls flatten parameter for tl.range calls.
             static_ranges: Whether to use tl.static_range instead tl.range.
+            load_eviction_policies: Eviction policies for load operations ("", "first", "last").
             num_warps: Number of warps per block.
             num_stages: Number of stages for software pipelining.
             pid_type: Program ID type strategy ("flat", "xyz", "persistent_blocked", "persistent_interleaved").
-            indexing: Indexing strategy ("pointer", "tensor_descriptor", "block_ptr").
+            indexing: Indexing strategy for load and store operations. Can be:
+                - A single strategy string (all loads/stores use this strategy):
+                  indexing="block_ptr"  # backward compatible
+                - A list of strategies (one per load/store operation, must specify all):
+                  indexing=["pointer", "block_ptr", "tensor_descriptor"]
+                - Empty/omitted (all loads/stores default to "pointer")
+                Valid strategies: "pointer", "tensor_descriptor", "block_ptr"
             **kwargs: Additional user-defined configuration parameters.
         """
         self.config = {}
@@ -74,6 +83,7 @@ class Config(Mapping[str, object]):
             "range_multi_buffers": range_multi_buffers,
             "range_flattens": range_flattens,
             "static_ranges": static_ranges,
+            "load_eviction_policies": load_eviction_policies,
             "num_warps": num_warps,
             "num_stages": num_stages,
             "indexing": indexing,
@@ -106,7 +116,13 @@ class Config(Mapping[str, object]):
         return self.config == other.config
 
     def __hash__(self) -> int:
-        return hash(frozenset([(k, _list_to_tuple(v)) for k, v in self.config.items()]))
+        return hash(frozenset([(k, _to_hashable(v)) for k, v in self.config.items()]))
+
+    def __getstate__(self) -> dict[str, object]:
+        return dict(self.config)
+
+    def __setstate__(self, state: dict[str, object]) -> None:
+        self.config = dict(state)
 
     def to_json(self) -> str:
         """Convert the config to a JSON string."""
@@ -190,11 +206,21 @@ class Config(Mapping[str, object]):
         return cast("list[bool]", self.config.get("static_ranges", []))
 
     @property
-    def indexing(self) -> IndexingLiteral:
-        return self.config.get("indexing", "pointer")  # type: ignore[return-value]
+    def load_eviction_policies(self) -> list[EvictionPolicyLiteral]:
+        return cast(
+            "list[EvictionPolicyLiteral]", self.config.get("load_eviction_policies", [])
+        )
+
+    @property
+    def indexing(self) -> IndexingLiteral | list[IndexingLiteral]:
+        return cast(
+            "IndexingLiteral | list[IndexingLiteral]", self.config.get("indexing", [])
+        )
 
 
-def _list_to_tuple(x: object) -> object:
+def _to_hashable(x: object) -> object:
     if isinstance(x, list):
-        return tuple([_list_to_tuple(i) for i in x])
+        return tuple([_to_hashable(i) for i in x])
+    if isinstance(x, dict):
+        return tuple(sorted([(k, _to_hashable(v)) for k, v in x.items()]))
     return x

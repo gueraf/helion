@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from .config_generation import ConfigGeneration
+from .effort_profile import RANDOM_SEARCH_DEFAULTS
 from .finite_search import FiniteSearch
 
 if TYPE_CHECKING:
@@ -31,10 +32,13 @@ class RandomSearch(FiniteSearch):
         self,
         kernel: BoundKernel,
         args: Sequence[object],
-        count: int = 1000,
+        count: int = RANDOM_SEARCH_DEFAULTS.count,
     ) -> None:
         super().__init__(
             kernel,
             args,
-            configs=ConfigGeneration(kernel.config_spec).random_population(count),
+            configs=ConfigGeneration(
+                kernel.config_spec,
+                overrides=kernel.settings.autotune_config_overrides or None,
+            ).random_population(count),
         )

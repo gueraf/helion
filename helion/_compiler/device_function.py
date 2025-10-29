@@ -38,8 +38,10 @@ from .variable_origin import TensorSizeOrigin
 
 if TYPE_CHECKING:
     from ..runtime.config import Config
+    from ..runtime.config import IndexingLiteral
     from .device_ir import HelperFunctionGraphInfo
     from .generate_ast import GenerateAST
+    from .indexing_strategy import IndexingStrategy
     from .program_id import ProgramIDs
 
     _P = TypeVar("_P", bound="TensorPropertyArg")
@@ -207,6 +209,7 @@ class DeviceFunction:
         ] = {}
         self._expr_args: dict[sympy.Expr, SymbolArgument] = {}
         self._constexpr_args: dict[str, ConstExprArg] = {}
+        self._constexpr_host_defs: set[str] = set()
         self._tensor_properties: dict[
             tuple[type[TensorPropertyArg], torch.Tensor, int], TensorPropertyArg
         ] = {}
@@ -224,6 +227,11 @@ class DeviceFunction:
                 "num_warps",
                 "num_stages",
             ]
+            + [
+                x.removeprefix("_triton_config_")
+                for x in config
+                if x.startswith("_triton_config_")
+            ]
         )
         self._variable_renames: dict[str, list[str]] = {}
         self.dce_vars: list[str] = []
@@ -235,14 +243,95 @@ class DeviceFunction:
 
         self.helper_manager = HelperFunctionManager()
 
-        from .indexing_strategy import IndexingStrategy
         from .tile_dispatch import TileStrategyDispatch
 
         self.tile_strategy: TileStrategyDispatch = TileStrategyDispatch(self, config)
-        self.indexing_strategy: IndexingStrategy = IndexingStrategy.select(config)
+
+        # Store indexing config to lazily create strategies per load/store
+        self._indexing_config = config.indexing
+        self.indexing_strategies: list[IndexingStrategy] = []
+
+        self.rng_seed_count = 0
+        self.device_load_index = 0
+        self.device_store_index = 0
+        # Single counter for both loads and stores for indexing assignment
+        self.device_memory_op_index = 0
+        self.rng_seed_buffer_param_name = None
+
+    def get_indexing_strategy(self, index: int) -> IndexingStrategy:
+        from typing import cast
+
+        from .indexing_strategy import IndexingStrategy
+        from .indexing_strategy import PointerIndexingStrategy
+
+        # Expand strategies list if needed
+        while len(self.indexing_strategies) <= index:
+            idx = len(self.indexing_strategies)
+
+            if isinstance(self._indexing_config, str):
+                # Single string: all loads/stores use the same strategy
+                if not self.indexing_strategies:
+                    strategy = IndexingStrategy.select(
+                        cast("IndexingLiteral", self._indexing_config)
+                    )
+                else:
+                    strategy = self.indexing_strategies[0]
+            elif isinstance(self._indexing_config, list) and self._indexing_config:
+                # List: one strategy per load/store
+                assert idx < len(self._indexing_config), (
+                    f"Load/Store operation {idx} exceeds indexing config length "
+                    f"{len(self._indexing_config)}. Please specify indexing for all loads and stores."
+                )
+                strategy = IndexingStrategy.select(
+                    cast("IndexingLiteral", self._indexing_config[idx])
+                )
+            else:
+                # Empty/default: use pointer
+                strategy = PointerIndexingStrategy()
+
+            self.indexing_strategies.append(strategy)
+
+        return self.indexing_strategies[index]
+
+    def has_rng_ops(self) -> bool:
+        """Check if this kernel uses any RNG operations."""
+        return self.rng_seed_count > 0 and self.rng_seed_buffer_param_name is not None
+
+    def allocate_rng_seed(self) -> int:
+        """Allocate a new RNG seed index and ensure buffer argument exists.
+
+        Returns:
+            The seed index for this RNG operation.
+        """
+        seed_index = self.rng_seed_count
+        self.rng_seed_count += 1
+
+        # Ensure seed buffer parameter name exists
+        if self.rng_seed_buffer_param_name is None:
+            self.rng_seed_buffer_param_name = self.new_var("rng_seed_buffer")
+
+        return seed_index
 
     def block_size_var(self, block_id: int) -> str | None:
-        return self.block_size_var_cache.get((block_id,))
+        key = (block_id,)
+
+        # Block size var could be used outside of a hl.tile loop, and at that point
+        # no tile strategy has populated the cache yet, so we must lazily create
+        # the constexpr argument here and lift it as device function argument;
+        # later strategies will reuse the cached name or intentionally replace it
+        # (e.g. flattened loops, reductions).
+        if key not in self.block_size_var_cache:
+            env = CompileEnvironment.current()
+            block_value = env.block_sizes[block_id].from_config(self.config)
+
+            if block_value is None:
+                return None
+
+            var_name = self.new_var(f"_BLOCK_SIZE_{block_id}")
+            self.block_size_var_cache[key] = var_name
+            self.constexpr_arg_with_host_def(var_name, block_value)
+
+        return self.block_size_var_cache[key]
 
     def try_map_block_symbols_to_vars(self, expr: sympy.Expr) -> sympy.Expr | None:
         """Try to map all block size symbols in expression to their variable names.
@@ -438,13 +527,52 @@ class DeviceFunction:
             self._expr_args[sym] = arg
         return self._expr_args[sym]
 
-    def constexpr_arg(self, name: str, host_str: str | None = None) -> bool:
+    def constexpr_arg(self, name: str, value: object | None = None) -> bool:
         """Create a constexpr argument, returns True if created, False if already exists."""
         if name in self._constexpr_args:
             return False
-        self._constexpr_args[name] = rv = ConstExprArg(name, host_str or name)
+        host_str = name if value is None else self._format_constexpr_value(value)
+        self._constexpr_args[name] = rv = ConstExprArg(name, host_str)
         self.arguments.append(rv)
         return True
+
+    def constexpr_arg_with_host_def(self, name: str, value: object) -> None:
+        """Create a constexpr argument and add its host-side definition if needed."""
+        created = self.constexpr_arg(name, value)
+        host_expr = self._constexpr_args[name].host_str()
+        if created or name not in self._constexpr_host_defs:
+            self.codegen.host_statements.append(
+                statement_from_string(f"{name} = {host_expr}")
+            )
+        self._constexpr_host_defs.add(name)
+
+    def _format_constexpr_value(self, value: object) -> str:
+        if isinstance(value, str):
+            return value
+        if isinstance(value, (int, float, bool)):
+            return repr(value)
+
+        # Extract sympy expression from torch symbolic types
+        if isinstance(value, (torch.SymInt, torch.SymFloat, torch.SymBool)):
+            value = value._sympy_()
+
+        # Handle sympy expressions (sanitize by replacing triton_helpers functions)
+        if isinstance(value, sympy.Expr):
+            sanitized = value.replace(  # pyright: ignore[reportAttributeAccessIssue]
+                lambda node: isinstance(node, sympy.Function)
+                and getattr(node.func, "__name__", "")
+                == "triton_helpers.div_floor_integer",
+                lambda node: sympy.floor(node.args[0] / node.args[1]),  # pyright: ignore[reportAttributeAccessIssue]
+            ).replace(  # pyright: ignore[reportAttributeAccessIssue]
+                lambda node: isinstance(node, sympy.Function)
+                and getattr(node.func, "__name__", "")
+                == "triton_helpers.remainder_integer",
+                lambda node: sympy.Mod(node.args[0], node.args[1]),  # pyright: ignore[reportAttributeAccessIssue]
+            )
+            expr = cast("sympy.Expr", sanitized)
+            return HostFunction.current().sympy_expr(expr)
+
+        return HostFunction.current().literal_expr(value)
 
     def _tensor_property(
         self,
@@ -487,15 +615,20 @@ class DeviceFunction:
             prefix.append(
                 statement_from_string("helion.runtime.set_triton_allocator()")
             )
+
+        args = [arg.arg_def_node() for arg in self.sorted_args()]
+        if self.has_rng_ops():
+            # Add the seed buffer as a pointer parameter to kernel signature
+            assert self.rng_seed_buffer_param_name is not None
+            args.append(create_arg(self.rng_seed_buffer_param_name))
+
         return [
             *prefix,
             ast_rename(
                 create(
                     ast.FunctionDef,
                     name=self.name,
-                    args=create_arguments(
-                        [arg.arg_def_node() for arg in self.sorted_args()]
-                    ),
+                    args=create_arguments(args),
                     body=[*self.preamble, *self.body],
                     decorator_list=[expr_from_string("triton.jit")],
                     type_params=[],
@@ -505,7 +638,16 @@ class DeviceFunction:
         ]
 
     def codegen_function_call(self) -> ast.AST:
-        args = [arg.host_str() for arg in self.sorted_args()]
+        args = []
+        for arg in self.sorted_args():
+            if isinstance(arg, ConstExprArg) and arg.name in self._constexpr_host_defs:
+                args.append(arg.name)
+            else:
+                args.append(arg.host_str())
+
+        if self.has_rng_ops():
+            # Pass the host-side seed buffer variable to the kernel
+            args.append("_rng_seed_buffer")
 
         # Workaround for triton bug: warp_specialize requires at least 4 warps
         # See: https://github.com/triton-lang/triton/issues/7354
@@ -518,13 +660,18 @@ class DeviceFunction:
                 f"num_warps={num_warps}",
                 f"num_stages={self.config.num_stages}",
             ]
+            + [
+                f"{x.removeprefix('_triton_config_')}={self.config[x]}"
+                for x in self.config
+                if x.startswith("_triton_config_")
+            ]
         )
         pid = self.pid
         assert pid is not None
         # TODO(jansel): we should run CSE this statement
         call_statement = statement_from_string(
-            f"_launcher({self.name}, __call_grid_expr, {', '.join(args)})",
-            __call_grid_expr=pid.codegen_grid(),
+            f"_launcher({self.name}, {{call_grid_expr}}, {', '.join(args)})",
+            call_grid_expr=pid.codegen_grid(),
         )
         assert isinstance(call_statement, ExtendedAST)
         # Mark the kernel call we can find it in codegen_precompile_def

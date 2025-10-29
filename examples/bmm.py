@@ -1,6 +1,6 @@
 """
 Batch Matrix Multiplication Example
-===============================
+===================================
 
 This example demonstrates how to implement a batch matrix multiplication kernel using Helion.
 """
@@ -8,19 +8,25 @@ This example demonstrates how to implement a batch matrix multiplication kernel 
 # %%
 # Imports
 # -------
+
+# %%
 from __future__ import annotations
 
+from packaging import version
 import torch
 
 import helion
+from helion._testing import DEVICE
 from helion._testing import run_example
 import helion.language as hl
 
-
 # %%
 # Batch Matrix Multiplication Kernel
-# -------------------------------
+# ----------------------------------
 # static_shapes=True gives a performance boost for matmuls
+
+
+# %%
 @helion.kernel(static_shapes=True)
 def bmm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     """
@@ -51,7 +57,10 @@ def bmm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
 
 # %%
 # Verification Function
-# -------------------
+# ---------------------
+
+
+# %%
 def check(b: int, m: int, k: int, n: int) -> None:
     """
     Verify the bmm kernel implementation against PyTorch's native bmm function.
@@ -62,14 +71,17 @@ def check(b: int, m: int, k: int, n: int) -> None:
         k: Second dimension of the first matrix / First dimension of the second matrix
         n: Second dimension of the second matrix
     """
-    x = torch.randn([b, m, k], device="cuda", dtype=torch.float16)
-    y = torch.randn([b, k, n], device="cuda", dtype=torch.float16)
+    x = torch.randn([b, m, k], device=DEVICE, dtype=torch.float16)
+    y = torch.randn([b, k, n], device=DEVICE, dtype=torch.float16)
     run_example(bmm, torch.bmm, (x, y))
 
 
 # %%
 # Main Function
-# -----------
+# -------------
+
+
+# %%
 def main() -> None:
     """
     Main entry point that runs the bmm kernel verification with specific parameters.
@@ -77,7 +89,9 @@ def main() -> None:
     Ensures torch version is at least 2.8 for 16-bit tensor support in baddbmm.
     """
     # torch.baddbmm support for 16-bit tensors requires torch 2.8+
-    assert torch.__version__.split(".")[:2] >= ["2", "8"], "Requires torch 2.8+"
+    assert version.parse(torch.__version__.split("+")[0]) >= version.parse("2.8"), (
+        "Requires torch 2.8+"
+    )
     check(16, 512, 768, 1024)
 
 

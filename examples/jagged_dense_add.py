@@ -1,6 +1,6 @@
 """
 Jagged Dense Addition Example
-=========================
+=============================
 
 This example demonstrates how to implement an addition operation between a jagged tensor
 and a dense tensor using Helion.
@@ -9,17 +9,22 @@ and a dense tensor using Helion.
 # %%
 # Imports
 # -------
+
+# %%
 from __future__ import annotations
 
 import torch
 
 import helion
+from helion._testing import DEVICE
 from helion._testing import run_example
 import helion.language as hl
 
 # %%
 # Jagged Tensor Format
-# -----------------
+# --------------------
+
+# %%
 """
 A tensor x is stored in a jagged-row, prefix-sparse layout that packs only the non-zero
 elements of each row. All non-zeros are concatenated into a one-dimensional buffer
@@ -33,7 +38,10 @@ omitted from storage.
 
 # %%
 # Jagged Dense Addition Kernel
-# ------------------------
+# ----------------------------
+
+
+# %%
 @helion.kernel()
 def jagged_dense_add_2d(
     x_data: torch.Tensor, x_offsets: torch.Tensor, y: torch.Tensor
@@ -77,7 +85,10 @@ def jagged_dense_add_2d(
 
 # %%
 # Reference Implementation
-# --------------------
+# ------------------------
+
+
+# %%
 def jagged_dense_add_2d_reference(
     x_data: torch.Tensor,
     x_offsets: torch.Tensor,
@@ -106,7 +117,10 @@ def jagged_dense_add_2d_reference(
 
 # %%
 # Utility Function
-# -------------
+# ----------------
+
+
+# %%
 def random_jagged_2d(
     num_rows: int,
     max_cols: int,
@@ -143,7 +157,10 @@ def random_jagged_2d(
 
 # %%
 # Main Function
-# -----------
+# -------------
+
+
+# %%
 def main() -> None:
     """
     Main entry point that runs the jagged dense add kernel verification.
@@ -152,8 +169,8 @@ def main() -> None:
     implementation against the PyTorch reference implementation.
     """
     rows, cols = 256, 5000
-    x_data, x_offsets = random_jagged_2d(rows, cols, device="cuda")
-    y = torch.randn([rows, cols], device="cuda")
+    x_data, x_offsets = random_jagged_2d(rows, cols, device=DEVICE)
+    y = torch.randn([rows, cols], device=DEVICE)
 
     run_example(
         jagged_dense_add_2d, jagged_dense_add_2d_reference, (x_data, x_offsets, y)

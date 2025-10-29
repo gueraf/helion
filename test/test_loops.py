@@ -3,15 +3,18 @@ from __future__ import annotations
 import functools
 from pathlib import Path
 import unittest
+from unittest.mock import patch
 
 import torch
 
 import helion
+from helion import _compat
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import import_path
+from helion._testing import skipIfLowVRAM
 from helion._testing import skipIfRefEager
 import helion.language as hl
 
@@ -31,7 +34,7 @@ def device_loop_3d(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
-@helion.kernel()
+@helion.kernel(static_shapes=False)
 def nested_loop_kernel(x: torch.Tensor) -> torch.Tensor:
     out = torch.empty_like(x)
     # Outer loop becomes grid (no tl.range)
@@ -40,6 +43,14 @@ def nested_loop_kernel(x: torch.Tensor) -> torch.Tensor:
         for tile_inner in hl.tile(x.size(1)):
             out[tile_outer, tile_inner] = x[tile_outer, tile_inner] + 1
     return out
+
+
+@helion.kernel()
+def inplace_nested_loop_kernel(x: torch.Tensor) -> torch.Tensor:
+    for tile_outer in hl.tile(x.size(0)):
+        for tile_inner in hl.tile(x.size(1)):
+            x[tile_outer, tile_inner] = x[tile_outer, tile_inner] + 1
+    return x
 
 
 class TestLoops(RefEagerTestBase, TestCase):
@@ -53,6 +64,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, torch.sigmoid(args[0] + 1))
         self.assertExpectedJournal(code)
 
+    @skipIfLowVRAM("Test requires high VRAM for [128, 128, 128, 128] tensors")
     def test_3d_device_loop0(self):
         args = (torch.randn([128, 128, 128, 128], device=DEVICE),)
         code, result = code_and_output(
@@ -63,6 +75,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, torch.sin(args[0]))
         self.assertExpectedJournal(code)
 
+    @skipIfLowVRAM("Test requires high VRAM for [128, 128, 128, 128] tensors")
     def test_3d_device_loop1(self):
         args = (torch.randn([128, 128, 128, 128], device=DEVICE),)
         code, result = code_and_output(
@@ -74,6 +87,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, torch.sin(args[0]))
         self.assertExpectedJournal(code)
 
+    @skipIfLowVRAM("Test requires high VRAM for [128, 128, 128, 128] tensors")
     def test_3d_device_loop2(self):
         args = (torch.randn([128, 128, 128, 128], device=DEVICE),)
         code, result = code_and_output(
@@ -86,6 +100,8 @@ class TestLoops(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, torch.sin(args[0]))
         self.assertExpectedJournal(code)
 
+    @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
+    @skipIfLowVRAM("Test requires high VRAM for [128, 128, 128, 128] tensors")
     def test_3d_device_loop3(self):
         args = (torch.randn([128, 128, 128, 128], device=DEVICE),)
         code, result = code_and_output(
@@ -98,6 +114,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, torch.sin(args[0]))
         self.assertExpectedJournal(code)
 
+    @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     def test_loop_fixed_block(self):
         @helion.kernel(config={"block_sizes": [], "indexing": "block_ptr"})
         def fn(x: torch.Tensor) -> torch.Tensor:
@@ -116,6 +133,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, torch.sin(args[0]))
         self.assertExpectedJournal(code)
 
+    @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     def test_loop_arg_block(self):
         @helion.kernel(config={"block_sizes": [], "indexing": "block_ptr"})
         def fn(x: torch.Tensor, block_size: int) -> torch.Tensor:
@@ -160,6 +178,29 @@ class TestLoops(RefEagerTestBase, TestCase):
         )
         self.assertExpectedJournal(code)
 
+    def test_use_block_size_var_without_hl_tile(self):
+        """Test that block size var can be used without hl.tile()."""
+
+        @helion.kernel(static_shapes=False)
+        def copy_blockwise(x: torch.Tensor) -> torch.Tensor:
+            n = x.size(0)
+            BLOCK = hl.register_block_size(4, 16)
+            out = torch.zeros_like(x)
+            num_tiles = (n + BLOCK - 1) // BLOCK
+            for tile_id in hl.grid(num_tiles):
+                base = tile_id * BLOCK
+                idx = base + hl.arange(BLOCK)
+                mask = idx < n
+                values = hl.load(x, [idx], extra_mask=mask)
+                hl.store(out, [idx], values, extra_mask=mask)
+            return out
+
+        x = torch.arange(37, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(copy_blockwise, (x,), block_sizes=[16])
+        torch.testing.assert_close(result, x)
+        self.assertIn("_BLOCK_SIZE_0: tl.constexpr", code)
+        self.assertIn("tl.arange(0, _BLOCK_SIZE_0)", code)
+
     @skipIfRefEager(
         "Test is block size dependent which is not supported in ref eager mode"
     )
@@ -183,6 +224,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         self.assertExpectedJournal(code)
         torch.testing.assert_close(result, args[0][:, : args[1][0].item()].sum(-1))
 
+    @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     def test_data_dependent_bounds2(self):
         @helion.kernel()
         def fn(x: torch.Tensor, end: torch.Tensor) -> torch.Tensor:
@@ -296,6 +338,45 @@ class TestLoops(RefEagerTestBase, TestCase):
         self.assertEqual(spec.min_size, 32)
         self.assertEqual(spec.max_size, 256)
 
+    def test_register_block_size_codegen_size_hint(self):
+        @helion.kernel(static_shapes=True)
+        def kernel_fixed_block_size(
+            y_pred: torch.Tensor,
+            y_true: torch.Tensor,
+        ) -> torch.Tensor:
+            BT, V_local = y_pred.shape
+
+            loss = torch.zeros((BT,), dtype=torch.float32, device=y_pred.device)
+            kl_loss = torch.zeros_like(y_pred)
+
+            block_size_n = hl.register_block_size(V_local)
+            BT_SIZE = 64
+            loss_sum = torch.zeros(
+                [BT_SIZE, block_size_n], dtype=torch.float32, device=y_pred.device
+            )
+
+            for tile_bt in hl.tile(BT, block_size=BT_SIZE):
+                loss_sum[:, :] = hl.zeros([BT_SIZE, block_size_n], dtype=torch.float32)
+                for tile_v in hl.tile(V_local, block_size=block_size_n):
+                    y_true_val = y_true[tile_bt, tile_v]
+                    kl_loss[tile_bt, tile_v] = y_true_val
+                    hl.atomic_add(loss_sum, [tile_bt, tile_v], kl_loss[tile_bt, tile_v])
+
+                loss[tile_bt] = loss_sum[:, :].sum(dim=-1)
+
+            return torch.sum(loss) / BT
+
+        y_pred = torch.randn(64, 128, device=DEVICE, dtype=torch.float32)
+        y_true = torch.randn(64, 128, device=DEVICE, dtype=torch.float32)
+        args = (y_pred, y_true)
+
+        code, result = code_and_output(kernel_fixed_block_size, args, block_sizes=[128])
+        self.assertExpectedJournal(code)
+
+        expected = y_true[:, :].sum() / y_pred.size(0)
+        torch.testing.assert_close(result, expected)
+
+    @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     def test_reorder_with_register_block_size(self):
         @helion.kernel(
             config={
@@ -317,6 +398,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, args[0] + 1)
         self.assertExpectedJournal(code)
 
+    @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     def test_l2_grouping_with_register_block_size(self):
         @helion.kernel(
             config={
@@ -453,7 +535,7 @@ class TestLoops(RefEagerTestBase, TestCase):
                 T1 = T_new
             return acc
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def chebyshev_kernel(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
             B, C = x.shape
             N, C = w.shape
@@ -529,7 +611,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         gets mutated in loops.
         """
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def kernel_with_assignment(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
             B, C = x.shape
             N, _ = w.shape
@@ -555,7 +637,7 @@ class TestLoops(RefEagerTestBase, TestCase):
                 grad_x[b_tile, c_tile] = acc
             return grad_x
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def kernel_without_assignment(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
             B, C = x.shape
             N, _ = w.shape
@@ -682,6 +764,18 @@ class TestLoops(RefEagerTestBase, TestCase):
             "tl.range(0, x_size_1.to(tl.int32), _BLOCK_SIZE_1, num_stages=3)", code3
         )
 
+    @skipIfRefEager("not supported in ref eager mode")
+    def test_range_num_stages_preserved_without_aliasing(self):
+        args = (torch.randn([16, 16], device=DEVICE),)
+        spec = nested_loop_kernel.bind(args).config_spec
+        self.assertGreater(len(spec.range_num_stages), 0)
+
+    @skipIfRefEager("not supported in ref eager mode")
+    def test_range_num_stages_removed_for_inplace_kernel(self):
+        args = (torch.randn([16, 16], device=DEVICE),)
+        spec = inplace_nested_loop_kernel.bind(args).config_spec
+        self.assertEqual(len(spec.range_num_stages), 0)
+
     def test_range_multi_buffers(self):
         # Test configuration validation - that range_multi_buffers works
         args = (torch.randn([64, 32], device=DEVICE),)
@@ -750,6 +844,25 @@ class TestLoops(RefEagerTestBase, TestCase):
         self.assertNotIn("flatten", code_none)
         self.assertIn("flatten=True", code_true)
         self.assertIn("flatten=False", code_false)
+
+    def test_specialize_shape_sequence(self):
+        @helion.kernel()
+        def specialize_shape_kernel(x: torch.Tensor) -> torch.Tensor:
+            shape = hl.specialize(x.shape)
+            m, n = shape
+            out = torch.empty_like(x)
+            for tile_m, tile_n in hl.tile([m, n]):
+                out[tile_m, tile_n] = x[tile_m, tile_n] + 1
+            return out
+
+        args = (torch.randn([32, 16], device=DEVICE),)
+        code, result = code_and_output(
+            specialize_shape_kernel,
+            args,
+            block_sizes=[16, 8],
+        )
+        torch.testing.assert_close(result, args[0] + 1)
+        self.assertIn("shape = (32, 16)", code)
 
     def test_static_range_2d(self):
         @helion.kernel()
@@ -883,7 +996,7 @@ class TestLoops(RefEagerTestBase, TestCase):
     def test_l2_grouping_3d(self):
         """Test L2 grouping with 3D tensors - grouping should apply to innermost 2 dimensions."""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def add_3d_kernel_l2(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             result = x.new_empty(x.size())
             for tile in hl.grid(x.size()):
@@ -912,7 +1025,7 @@ class TestLoops(RefEagerTestBase, TestCase):
     def test_l2_grouping_4d(self):
         """Test L2 grouping with 4D tensors - grouping should apply to innermost 2 dimensions."""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def add_4d_kernel_l2(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             result = x.new_empty(x.size())
             for tile in hl.grid(x.size()):
@@ -946,7 +1059,7 @@ class TestLoops(RefEagerTestBase, TestCase):
     def test_l2_grouping_with_loop_order(self):
         """Test L2 grouping with loop order permutation - should apply to fastest varying dims."""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def add_3d_kernel_reordered(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             result = x.new_empty(x.size())
             for tile in hl.grid(x.size()):
@@ -982,7 +1095,7 @@ class TestLoops(RefEagerTestBase, TestCase):
     def test_full_with_dynamic_fill_value(self):
         """Test hl.full with dynamic fill value from scalar tensor."""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def kernel_with_dynamic_fill(
             x: torch.Tensor, fill_value: torch.Tensor
         ) -> torch.Tensor:
@@ -1107,6 +1220,48 @@ class TestLoops(RefEagerTestBase, TestCase):
 
         torch.testing.assert_close(result, expected, atol=1e-5, rtol=1e-5)
         self.assertExpectedJournal(code)
+
+    @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
+    def test_unroll_with_pipelining(self):
+        @helion.kernel(static_shapes=True)
+        def matmul(
+            x: torch.Tensor,
+            y: torch.Tensor,
+        ) -> torch.Tensor:
+            m, k = x.size()
+            k2, n = y.size()
+            assert k == k2, f"size mismatch {k} != {k2}"
+            out = torch.empty(
+                [m, n], dtype=torch.promote_types(x.dtype, y.dtype), device=x.device
+            )
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc
+            return out
+
+        a = torch.randn(256, 256, device=DEVICE, dtype=torch.bfloat16)
+        b = torch.randn(256, 256, device=DEVICE, dtype=torch.bfloat16)
+
+        code, result = code_and_output(
+            matmul,
+            (a, b),
+            block_sizes=[64, 16, 16],
+            indexing="block_ptr",
+            loop_orders=[[1, 0]],
+            pid_type="persistent_blocked",
+            range_num_stages=[4, 2],
+            range_unroll_factors=[4, 4],
+        )
+
+        expected = torch.matmul(a, b)
+        torch.testing.assert_close(result, expected, atol=1e-2, rtol=1e-2)
+        self.assertExpectedJournal(code)
+
+        # Logic for modifying num_stages and loop unrolling factors should
+        # change num_stages=1
+        self.assertIn("num_stages=1", code)
 
 
 if __name__ == "__main__":

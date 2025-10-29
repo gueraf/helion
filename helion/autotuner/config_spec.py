@@ -18,6 +18,7 @@ from .config_fragment import BooleanFragment
 from .config_fragment import ConfigSpecFragment
 from .config_fragment import EnumFragment
 from .config_fragment import IntegerFragment
+from .config_fragment import ListOf
 from .config_fragment import NumWarpsFragment
 from .config_fragment import PermutationFragment
 from .config_fragment import PowerOfTwoFragment
@@ -32,7 +33,7 @@ if TYPE_CHECKING:
     from ..runtime.config import PidTypeLiteral
 
 DEFAULT_NUM_WARPS = 4
-DEFAULT_NUM_STAGES = 3
+DEFAULT_NUM_STAGES = 1
 VALID_KEYS: frozenset[str] = frozenset(
     [
         "block_sizes",
@@ -50,9 +51,11 @@ VALID_KEYS: frozenset[str] = frozenset(
         "num_stages",
         "pid_type",
         "indexing",
+        "load_eviction_policies",
     ]
 )
 VALID_PID_TYPES = ("flat", "xyz", "persistent_blocked", "persistent_interleaved")
+VALID_EVICTION_POLICIES = ("", "first", "last")
 
 
 @dataclasses.dataclass
@@ -97,11 +100,21 @@ class ConfigSpec:
         default_factory=functools.partial(tuple, VALID_PID_TYPES)
     )
     grid_block_ids: list[int] = dataclasses.field(default_factory=list)
+    load_eviction_policies: ListOf = dataclasses.field(
+        default_factory=lambda: ListOf(
+            EnumFragment(choices=VALID_EVICTION_POLICIES), length=0
+        )
+    )
+    indexing: ListOf = dataclasses.field(
+        default_factory=lambda: ListOf(
+            EnumFragment(choices=ConfigSpec._valid_indexing_types()), length=0
+        )
+    )
 
     @staticmethod
     def _valid_indexing_types() -> tuple[IndexingLiteral, ...]:
         return (
-            ("pointer", "block_ptr", "tensor_descriptor")
+            ("pointer", "tensor_descriptor")
             if supports_tensor_descriptor()
             else ("pointer", "block_ptr")
         )
@@ -188,13 +201,6 @@ class ConfigSpec:
                     name, config.get(name, ()), block_ids=static_range_block_ids
                 )
 
-        # Only one range_warp_specializes is allowed, take the last one
-        range_warp_specializes = cast(
-            "list[bool | None]", config.get("range_warp_specializes", [])
-        )
-        for i in [j for j, val in enumerate(range_warp_specializes) if val][:-1]:
-            range_warp_specializes[i] = None
-
         for name in (
             "loop_orders",
             "l2_groupings",
@@ -206,18 +212,21 @@ class ConfigSpec:
             "range_multi_buffers",
             "range_flattens",
             "static_ranges",
+            "load_eviction_policies",
+            "indexing",
         ):
-            if not config[name]:
-                config.pop(name)
+            if not config.get(name):
+                config.pop(name, None)
 
         config.setdefault("num_warps", DEFAULT_NUM_WARPS)
         config.setdefault("num_stages", DEFAULT_NUM_STAGES)
+        config.setdefault(
+            "load_eviction_policies", self.load_eviction_policies.default()
+        )
+        config.setdefault("indexing", self.indexing.default())
         # TODO(jansel): include num_ctas and max_nreg
 
-        for name, values in (
-            ("pid_type", VALID_PID_TYPES),
-            ("indexing", self._valid_indexing_types()),
-        ):
+        for name, values in (("pid_type", VALID_PID_TYPES),):
             if name in config:
                 if config[name] not in values:
                     raise InvalidConfig(
@@ -240,6 +249,27 @@ class ConfigSpec:
                     name, config.get(name, ()), block_ids=self.grid_block_ids
                 )
 
+        range_warp_specializes = cast(
+            "list[bool | None]", config.get("range_warp_specializes", [])
+        )
+
+        if range_warp_specializes and any(range_warp_specializes):
+            # Only one range_warp_specializes is allowed, take the first one
+            # Prefer warp specialize on outermost loop
+            first_idx = range_warp_specializes.index(True)
+            for i in range(first_idx + 1, len(range_warp_specializes)):
+                range_warp_specializes[i] = None
+
+            range_unroll_factors = cast(
+                "list[int]", config.get("range_unroll_factors", [])
+            )
+            if range_unroll_factors and range_unroll_factors[first_idx] > 1:
+                if range_unroll_factors[first_idx]:
+                    range_unroll_factors[first_idx] = 0
+
+                config["range_unroll_factors"] = range_unroll_factors
+
+        config["range_warp_specializes"] = range_warp_specializes
         # Allow tunable parameter keys in addition to VALID_KEYS
         allowed_keys = VALID_KEYS | {*self.user_defined_tunables.keys()}
         if invalid_keys := ({*config} - allowed_keys):
@@ -264,12 +294,14 @@ class ConfigSpec:
             "static_ranges": self.static_ranges._flat_config(self, fn),
             "num_warps": fn(NumWarpsFragment(1, 32, DEFAULT_NUM_WARPS)),
             "num_stages": fn(IntegerFragment(1, 8, DEFAULT_NUM_STAGES)),
-            "indexing": fn(EnumFragment(self._valid_indexing_types())),
+            "indexing": fn(self.indexing),
             "pid_type": fn(EnumFragment(self.allowed_pid_types)),
+            "load_eviction_policies": fn(self.load_eviction_policies),
         }
         # Add tunable parameters
-        for key, fragment in self.user_defined_tunables.items():
-            config[key] = fn(fragment)
+        config.update(
+            {key: fn(fragment) for key, fragment in self.user_defined_tunables.items()}
+        )
 
         for name in (
             "loop_orders",
@@ -282,9 +314,11 @@ class ConfigSpec:
             "range_multi_buffers",
             "range_flattens",
             "static_ranges",
+            "load_eviction_policies",
+            "indexing",
         ):
-            if not config[name]:
-                config.pop(name)
+            if not config.get(name):
+                config.pop(name, None)
         self.normalize(config)
         return helion.Config(**config)
 
@@ -365,9 +399,7 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
         reduction_numel = _product(
             [next_power_of_2(spec.size_hint) for spec in base.reduction_loops]
         )
-        if total_ndim <= 1 and reduction_numel <= 1:
-            default = 1024
-        elif total_ndim <= 2 and reduction_numel <= 128:
+        if total_ndim <= 2 and reduction_numel <= 128:
             default = 32
         elif reduction_numel <= 256:
             default = 16
@@ -407,10 +439,15 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
         self, base: ConfigSpec, fn: Callable[[ConfigSpecFragment], object]
     ) -> int | None:
         low = 8  # TODO(jansel): is smaller needed?
-        high = next_power_of_2(self.size_hint)
+        high = next_power_of_2(max(low, self.size_hint))
         default = min(high, 4096)
         value = fn(BlockSizeFragment(low, high, default))
         assert isinstance(value, int)
+
+        if not (low <= value <= high):
+            raise InvalidConfig(
+                f"Invalid value for reduction loop {low} <= {value} <= {high}"
+            )
         if value >= self.size_hint:
             return None  # max size becomes persistent reduction
         return value

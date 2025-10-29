@@ -1,6 +1,6 @@
 """
 Jagged Softmax Example
-===============
+======================
 
 This example demonstrates how to compute the softmax across each batch in a jagged tensor using Helion.
 """
@@ -8,20 +8,26 @@ This example demonstrates how to compute the softmax across each batch in a jagg
 # %%
 # Imports
 # -------
+
+# %%
 from __future__ import annotations
 
 import itertools
+from typing import Callable
 
 import torch
 
 import helion
+from helion._testing import DEVICE
 from helion._testing import run_example
 import helion.language as hl
 
-
 # %%
 # Reference Implementation
-# --------------------
+# ------------------------
+
+
+# %%
 def reference_jagged_softmax_pytorch(
     x_data: torch.Tensor,
     x_offsets: torch.Tensor,
@@ -45,7 +51,10 @@ def reference_jagged_softmax_pytorch(
 
 # %%
 # Jagged Softmax Kernel
-# ---------------
+# ---------------------
+
+
+# %%
 @helion.kernel()
 def jagged_softmax_kernel(
     x_data: torch.Tensor,
@@ -133,14 +142,18 @@ def jagged_softmax_kernel(
 
 # %%
 # Benchmark Wrapper
-# --------------
+# -----------------
+
+
+# %%
 def jagged_softmax_tritonbench(
-    x: torch.Tensor, B: int, M: int, seqlen: int, sparsity: float
-) -> torch.Tensor:
+    tb_op: object, x: torch.Tensor, B: int, M: int, seqlen: int, sparsity: float
+) -> Callable[[], torch.Tensor]:
     """
     Wrapper for tritonbench that matches the expected interface.
 
     Args:
+        tb_op: TritonBench operator instance
         x: Nested tensor in jagged format with shape (B, *, M)
         B: Batch size (unused)
         M: Number of features (unused)
@@ -148,20 +161,23 @@ def jagged_softmax_tritonbench(
         sparsity: Sparsity factor (unused)
 
     Returns:
-        Tensor of shape (N, M), where N = total number of rows in the jagged tensor
+        Callable that returns tensor of shape (N, M), where N = total number of rows in the jagged tensor
     """
-    return jagged_softmax_kernel(x._values, x._offsets)  # pyright: ignore[reportArgumentType, reportAttributeAccessIssue]
+    return lambda: jagged_softmax_kernel(x._values, x._offsets)  # pyright: ignore[reportArgumentType, reportAttributeAccessIssue]
 
 
 # %%
 # Main Function
-# -----------
+# -------------
+
+
+# %%
 def main() -> None:
     """
     Main entry point for jagged softmax kernel verification.
     """
     num_rows, max_cols = 512, 64
-    device = "cuda"
+    device = DEVICE
 
     lengths = torch.randint(1, max_cols + 1, (num_rows,), device=device)
     x_offsets = torch.cat(

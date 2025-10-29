@@ -6,14 +6,12 @@
 :hidden:
 
 installation
+deployment_autotuning
 ./examples/index
 helion_puzzles
 api/index
 
 ```
-
-> ⚠️ **Early Development Warning**
-> Helion is currently in an experimental stage. You should expect bugs, incomplete features, and APIs that may change in future versions. Feedback and bug reports are welcome and appreciated!
 
 **Helion** is a Python-embedded domain-specific language (DSL) for
 authoring machine learning kernels, designed to compile down to [Triton],
@@ -37,6 +35,7 @@ portable between different hardware. Helion automates and autotunes over:
 
     * Automatically calculates strides and indices.
     * Autotunes choices among various indexing methods (pointers, block pointers, TensorDescriptors).
+    * Supports per-operation indexing strategies for fine-grained memory access control of loads and stores.
 
 2. **Masking:**
 
@@ -67,6 +66,12 @@ portable between different hardware. Helion automates and autotunes over:
     * Loop reordering.
     * Persistent kernel strategies.
     * Warp specialization choices, unrolling, and more.
+
+## Try Helion Now
+
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/pytorch/helion/blob/main/notebooks/softmax.ipynb)
+
+Try our [interactive demo notebook](https://github.com/pytorch/helion/blob/main/notebooks/softmax.ipynb) to see Helion in action! The notebook demonstrates softmax kernel implementations and runs directly in Google Colab on a GPU.
 
 ## Example
 
@@ -214,7 +219,7 @@ Example combining both:
 ```python
 @helion.kernel(
     # Settings: Control compilation behavior
-    use_default_config=True,      # Skip autotuning for development
+    autotune_effort="none",      # Skip autotuning for development
     print_output_code=True,       # Debug: show generated code
     # Config: Control GPU execution (when not using default)
     # config=helion.Config(block_sizes=[64, 32], num_warps=8)
@@ -227,8 +232,8 @@ def debug_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 ## Settings for Development and Debugging
 
 When developing kernels with Helion, you might prefer skipping autotuning for faster iteration. To
-do this, set the environment variable `HELION_USE_DEFAULT_CONFIG=1` or use the decorator argument
-`@helion.kernel(use_default_config=True)`. **Warning:** The default configuration is slow and not intended for
+do this, set the environment variable `HELION_AUTOTUNE_EFFORT=none` or use the decorator argument
+`@helion.kernel(autotune_effort="none")`. **Warning:** The default configuration is slow and not intended for
 production or performance testing.
 
 To view the generated Triton code, set the environment variable `HELION_PRINT_OUTPUT_CODE=1` or include
@@ -238,6 +243,8 @@ helpful for debugging and understanding Helion's compilation process.  One can a
 
 To force autotuning, bypassing provided configurations, set `HELION_FORCE_AUTOTUNE=1` or invoke `foo_kernel.autotune(args,
 force=True)`.
+
+For reproducible autotuning results, set `HELION_AUTOTUNE_RANDOM_SEED=<seed>` to seed Python's random module before the search begins. You can also pass `autotune_random_seed=...` to `@helion.kernel` to control the seed per kernel.
 
 Additional settings are available in the {doc}`api/settings` documentation. If both an environment
 variable and a kernel decorator argument are set, the kernel decorator argument takes precedence, and the environment

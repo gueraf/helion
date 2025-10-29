@@ -1,6 +1,6 @@
 # Exceptions
 
-The `helion.exc` module provides a exception hierarchy for error handling and diagnostics.
+The `helion.exc` module provides an exception hierarchy for error handling and diagnostics.
 
 ```{eval-rst}
 .. currentmodule:: helion.exc
@@ -115,6 +115,10 @@ These exceptions occur when Helion language functions are used incorrectly with 
 
    Raised when tuple unpacking fails for single tile.
 
+.. autoclass:: InvalidTileRange
+
+   Raised when ``hl.tile`` is given a range where the begin exceeds the end.
+
 .. autoclass:: OverpackedTile
 
    Raised when tile is wrapped in container when indexing.
@@ -134,6 +138,10 @@ These exceptions occur when Helion language functions are used incorrectly with 
 .. autoclass:: InvalidIndexingType
 
    Raised for invalid types in tensor subscripts.
+
+.. autoclass:: DataDependentOutputShapeNotSupported
+
+   Raised when operations that produce data-dependent output shapes are used inside Helion device loops.
 
 .. autoclass:: HostTensorDirectUsage
 

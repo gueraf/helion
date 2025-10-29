@@ -1,4 +1,4 @@
-name: Run Tests
+name: Tests
 
 on:
   pull_request:
@@ -18,7 +18,7 @@ jobs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Load matrix from file
         id: set-matrix
@@ -33,7 +33,7 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.load-matrix.outputs.matrix) }}
 
-    name: test-${{ matrix.runtime-version }}-py${{ matrix.python-version }}-${{ matrix.alias }}
+    name: test-${{ matrix.runtime-version }}-py${{ matrix.python-version }}-${{ matrix.pytorch-version }}-${{ matrix.alias }}
 
     container:
       image: ${{ matrix.image }}
@@ -47,11 +47,23 @@ jobs:
         shell: bash -l {0}
 
     steps:
+      - name: Run NVIDIA command
+        if: startsWith(matrix.image, 'nvidia')
+        run: |
+          echo "Detected NVIDIA image"
+          nvidia-smi || echo "nvidia-smi not found"
+
+      - name: Run ROCm command
+        if: startsWith(matrix.image, 'rocm')
+        run: |
+          echo "Detected ROCm image"
+          rocminfo || echo "rocminfo not found"
+
       - name: Check out code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@v7
         with:
           python-version: ${{ matrix.python-version }}
           enable-cache: true
@@ -71,23 +83,29 @@ jobs:
           path: |
             ~/.cache/uv
             ~/.venv
-          key: ${{ matrix.python-version }}-${{ matrix.runtime-version }}-${{ hashFiles('.github/workflows/test.yml', 'requirements.txt') }}-${{ steps.date.outputs.month }}
+          key: ${{ matrix.python-version }}-${{ matrix.runtime-version }}-${{ matrix.pytorch-version }}-${{ hashFiles('.github/workflows/test.yml', 'requirements.txt') }}-${{ steps.date.outputs.month }}
 
       - name: Install PyTorch
         run: |
           source .venv/bin/activate
-          uv pip install -U --pre torch --index-url https://download.pytorch.org/whl/nightly/${{ matrix.runtime-version }}
+          if [[ "${{ matrix.pytorch-version }}" == "pytorch-2.9" ]]; then
+            # Install stable 2.9 from test channel
+            uv pip install -U "torch==2.9.*" --index-url https://download.pytorch.org/whl/${{ matrix.runtime-version }}
+          else
+            # Default to nightly
+            uv pip install -U --pre torch --index-url https://download.pytorch.org/whl/nightly/${{ matrix.runtime-version }}
+          fi
 
       - name: Install Triton
-        if: steps.cache.outputs.cache-hit != 'true'
+        if: steps.cache.outputs.cache-hit != 'true' && matrix.pytorch-version != 'pytorch-2.9'
         run: |
           set -x
           source .venv/bin/activate
           apt-get update
           apt-get install -y git
-          apt-get install -y gcc-13 g++-13 zlib1g-dev
-          export CC=gcc-13
-          export CXX=g++-13
+          apt-get install -y clang-20 clang++-20 zlib1g-dev
+          export CC=clang-20
+          export CXX=clang++-20
           mkdir -p /tmp/$USER
           cd /tmp/$USER
           uv pip uninstall triton pytorch-triton || true
@@ -98,14 +116,86 @@ jobs:
           MAX_JOBS=$(nproc) TRITON_PARALLEL_LINK_JOBS=2 uv pip install .
           cd /tmp/$USER
           rm -rf triton/
+          python -c "import triton; print(f'Triton version: {triton.__version__}')"
 
       - name: Install Requirements
         run: |
           source .venv/bin/activate
           uv pip install -r requirements.txt
-          uv pip install pytest-timeout
+          uv pip install pytest-timeout setuptools
 
       - name: Run Tests
         run: |
           source .venv/bin/activate
-          HELION_INTERPRET=$([[ "${{ matrix.ref-mode }}" == "ref-eager" ]] && echo "1") pytest --timeout=30
+          # Conditionally enable ref-eager and golden-accept/dtype-assert test modes
+          if [[ "${{ matrix.dtype-asserts }}" == "true" ]]; then export HELION_DEBUG_DTYPE_ASSERTS=1; fi
+          if [[ "${{ matrix.expecttest-accept }}" == "true" ]]; then export EXPECTTEST_ACCEPT=1; fi
+          if [[ "${{ matrix.ref-eager }}" == "true" ]]; then export HELION_INTERPRET=1; fi
+          # -rf: print failed tests
+          # --timeout: max allowed time for each test
+          pytest -rf --timeout=60
+
+  test-notebooks:
+    name: test-notebooks-cu128-py3.12-pytorch-2.9-a10g
+
+    container:
+      image: nvidia/cuda:12.8.1-devel-ubuntu24.04
+      options: --gpus all
+
+    runs-on: linux.g5.4xlarge.nvidia.gpu
+
+    defaults:
+      run:
+        shell: bash -l {0}
+
+    steps:
+      - name: Run NVIDIA command
+        run: |
+          echo "Detected NVIDIA image"
+          nvidia-smi || echo "nvidia-smi not found"
+
+      - name: Check out code
+        uses: actions/checkout@v5
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Create virtual environment
+        run: |
+          uv venv --python 3.12
+
+      - name: Install pip in venv
+        run: |
+          source .venv/bin/activate
+          uv pip install pip
+
+      - name: Get current month
+        id: date
+        run: echo "month=$(date +'%Y-%m')" >> $GITHUB_OUTPUT
+
+      - name: Cache dependencies
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/uv
+            ~/.venv
+          key: notebooks-3.12-cu128-${{ hashFiles('.github/workflows/test.yml') }}-${{ steps.date.outputs.month }}
+
+      - name: Install notebook execution tools
+        run: |
+          source .venv/bin/activate
+          # Install jupyter for executing notebooks
+          uv pip install jupyter nbconvert pytest numpy
+
+      - name: Run Notebook Tests
+        run: |
+          source .venv/bin/activate
+          # Execute notebook using jupyter nbconvert
+          # The notebook's subprocess pip install will install torch and helion
+          jupyter nbconvert --to notebook --execute --inplace \
+            --ExecutePreprocessor.timeout=600 \
+            notebooks/softmax.ipynb

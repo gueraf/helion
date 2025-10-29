@@ -17,25 +17,17 @@ classifiers = [
 license = { file = "LICENSE" }
 requires-python = ">=3.10"
 dependencies = [
-    "torch>=2.7.0",
     "typing_extensions>=4.0.0",
     "filecheck",
-    "psutil"
+    "psutil",
+    "tqdm",
+    "rich"
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest",
     "pre-commit"
-]
-docs = [
-    "sphinx",
-    "myst-parser",
-    "sphinx-rtd-theme",
-    "sphinx-autodoc-typehints",
-    "linkify-it-py",
-    "sphinx-autobuild",
-    "sphinx-gallery"
 ]
 
 [project.urls]
@@ -51,7 +43,7 @@ src = ["helion"]
 docstring-code-format = true
 quote-style = "double"
 line-ending = "lf"
-exclude = [".github/*"]
+exclude = [".github/*", "notebooks/**/*.ipynb"]
 
 [tool.ruff.lint]
 select = [
@@ -68,11 +60,11 @@ select = [
 ]
 ignore = [
     "C409", "C419", "COM812", "E501", "ERA001", "FURB189", "G004", "PERF203", "PERF401",
-    "RET501", "SIM102", "SIM108", "SIM115", "UP035", "UP038",
+    "RET501", "SIM102", "SIM108", "SIM115", "UP035",
 ]
 extend-safe-fixes = ["TC", "UP045", "RUF013", "RSE102"]
 preview = true
-exclude = ["test/data/*", ".github/*"]
+exclude = ["test/data/*", ".github/*", "notebooks/**/*.ipynb"]
 
 [tool.ruff.lint.per-file-ignores]
 "test/*" = ["ANN"]

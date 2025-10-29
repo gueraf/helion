@@ -5,7 +5,6 @@ import builtins
 import contextlib
 import dataclasses
 import functools
-import inspect
 import re
 import types
 from typing import TYPE_CHECKING
@@ -23,6 +22,7 @@ from torch.fx.experimental import proxy_tensor
 from torch.utils._pytree import tree_map_only
 
 from .. import exc
+from .. import language as language_module
 from ..autotuner.config_fragment import ConfigSpecFragment
 from ..autotuner.config_spec import BlockSizeSpec
 from ..language._decorators import get_device_func_replacement
@@ -30,6 +30,7 @@ from ..language._decorators import is_api_func
 from ..language.stack_tensor import StackTensor
 from ..language.tile_proxy import Tile
 from ..language.tile_proxy import _CheckForIndexCalls
+from ..runtime.kernel import Kernel
 from .ast_extension import ExtendedAST
 from .ast_extension import LoopType
 from .ast_extension import create
@@ -38,10 +39,12 @@ from .compile_environment import CompileEnvironment
 from .compile_environment import FixedBlockSizeSource
 from .compile_environment import LoopSpecBlockSizeSource
 from .compile_environment import warning
+from .device_function import contains_only_block_size_symbols
 from .host_function import HostFunction
 from .host_function import SymbolOrigin
 from .output_header import library_imports
 from .source_location import current_location
+from .tensor_utils import patch_tensor_factories
 from .utils import compute_slice_size
 from .variable_origin import ArgumentOrigin
 from .variable_origin import AttributeOrigin
@@ -53,7 +56,6 @@ from .variable_origin import GridOrigin
 from .variable_origin import Origin
 from .variable_origin import SourceOrigin
 from .variable_origin import TensorSizeOrigin
-import helion
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -96,7 +98,7 @@ class GlobalScope(Scope):
             else:
                 raise exc.UndefinedVariable(name) from None
         else:
-            if value is helion.language:
+            if value is language_module:
                 origin = GlobalOrigin(name="hl", function=self.function)
                 return TypeInfo.from_example(value, origin)
             if name in library_imports:
@@ -104,6 +106,8 @@ class GlobalScope(Scope):
                 return TypeInfo.from_example(value, origin)
 
             origin = self.function.global_scope_origin(name)
+            if isinstance(value, Kernel):
+                return TypeInfo.from_example(value, origin)
             if not isinstance(
                 value,
                 (types.ModuleType, types.FunctionType, types.BuiltinFunctionType),
@@ -272,6 +276,29 @@ class TypeInfo:
             # This allows zip to work in list comprehensions
             zipped_tuples = tuple(tuple(items) for items in value)
             return cls.from_example(zipped_tuples, origin)
+        if isinstance(
+            value, (torch.cuda._CudaDeviceProperties, torch.xpu._XpuDeviceProperties)
+        ):
+            attrs = {}
+            env = CompileEnvironment.current()
+
+            compute_unit_literal = (
+                "gpu_subslice_count"
+                if torch.xpu.is_available()
+                else "multi_processor_count"
+            )
+
+            # Only `multi_processor_count` attribute is supported for now
+            # TODO(yf225): support other torch.cuda._CudaDeviceProperties attributes
+            attr_origin = AttributeOrigin(origin, compute_unit_literal)
+            # Create a symbolic integer that can be passed as kernel argument
+            sym = env.create_unbacked_symint()
+            HostFunction.current().expr_to_origin[sym._sympy_()] = SymbolOrigin(
+                origin=attr_origin
+            )
+            attrs[compute_unit_literal] = SymIntType(attr_origin, sym)
+
+            return ClassType(origin, attrs)
         raise exc.UnsupportedPythonType(type(value).__name__)
 
     @staticmethod
@@ -451,6 +478,16 @@ class TensorType(TypeInfo):
                 if self.origin.is_device():
                     output_sizes.append(output_size)
                 elif output_size != 1:
+                    # If all symbols in output_size are block size symbols, we reuse them
+                    if isinstance(output_size, torch.SymInt):
+                        expr = output_size._sympy_()
+                        if (
+                            isinstance(expr, sympy.Expr)
+                            and expr.free_symbols
+                            and contains_only_block_size_symbols(expr)
+                        ):
+                            output_sizes.append(output_size)
+                            continue
                     rdim = CompileEnvironment.current().allocate_reduction_dimension(
                         output_size
                     )
@@ -460,6 +497,10 @@ class TensorType(TypeInfo):
             elif isinstance(k, TileIndexType):
                 inputs_consumed += 1
                 output_sizes.append(env.block_sizes[k.block_id].var)
+            elif isinstance(k, TensorType) and k.fake_value.dtype == torch.bool:
+                raise exc.DataDependentOutputShapeNotSupported(
+                    op_desc="Boolean mask indexing (tensor[boolean_mask])"
+                )
             elif isinstance(k, TensorType) and k.fake_value.ndim == 1:
                 inputs_consumed += 1
                 output_sizes.append(k.fake_value.size(0))
@@ -733,6 +774,15 @@ class CallableType(LiteralType):
     def propagate_call(  # pyright: ignore[reportIncompatibleMethodOverride]
         self, args: tuple[TypeInfo, ...], kwargs: dict[str, TypeInfo], origin: Origin
     ) -> TypeInfo | None:
+        if self.value is breakpoint:
+            # special handling to prevent breakpoint() from being called during host-code type propagation
+            return LiteralType(origin, None)
+        if self.value in (torch.nonzero, torch.Tensor.nonzero) and origin.is_device():
+            raise exc.DataDependentOutputShapeNotSupported(op_desc="torch.nonzero")
+        if self.value in (torch.chunk, torch.Tensor.chunk) and origin.is_device():
+            raise exc.UnsupportedSplitOperation(op="torch.chunk")
+        if self.value in (torch.unbind, torch.Tensor.unbind) and origin.is_device():
+            raise exc.UnsupportedSplitOperation(op="torch.unbind")
         if is_api_func(fn := self.value):
             if fn._is_device_only and origin.is_host():
                 raise exc.DeviceAPIOnHost(fn.__qualname__)
@@ -1009,7 +1059,8 @@ class TileIndexType(TypeInfo):
                 torch._C._TorchDispatchModeKey.FAKE  # pyright: ignore[reportAttributeAccessIssue]
             )
             try:
-                return Tile(self.block_id)
+                with torch._C._DisableTorchDispatch():  # pyright: ignore[reportAttributeAccessIssue]
+                    return Tile(self.block_id)
             finally:
                 assert fake_mode is not None
                 torch._C._set_dispatch_mode(fake_mode)  # pyright: ignore[reportAttributeAccessIssue]
@@ -1048,6 +1099,19 @@ class TileIndexType(TypeInfo):
         if isinstance(getattr(Tile, attr, None), property):
             return TypeInfo.from_example(getattr(self.proxy(), attr), origin)
         return super().propagate_attribute(attr, origin)
+
+
+class BlockSizeType(SymIntType):
+    """Type for block sizes registered via register_block_size"""
+
+    block_id: int
+
+    def __init__(self, origin: Origin, value: torch.SymInt, block_id: int) -> None:
+        super().__init__(origin, value)
+        self.block_id = block_id
+
+    def __str__(self) -> str:
+        return f"{type(self).__name__}({self.block_id})"
 
 
 class GridIndexType(SymIntType):
@@ -1090,38 +1154,6 @@ class GridIndexType(SymIntType):
                 return self
             raise exc.TypeInferenceError(
                 f"GridIndexType mismatch in control flow: {self.block_id} vs {other.block_id}"
-            )
-        return super().merge(other, var_name=var_name)
-
-
-class ReductionDimType(SymIntType):
-    """Type for reduction dimensions allocated via register_reduction_dim"""
-
-    block_id: int
-
-    def __init__(self, origin: Origin, block_id: int) -> None:
-        from .._compiler.compile_environment import CompileEnvironment
-
-        env = CompileEnvironment.current()
-        super().__init__(origin, env.block_sizes[block_id].var)
-        self.block_id = block_id
-
-    def __str__(self) -> str:
-        return f"{type(self).__name__}({self.block_id})"
-
-    def proxy(self) -> torch.SymInt:
-        """Return the RDIM variable when used in expressions"""
-        from .._compiler.compile_environment import CompileEnvironment
-
-        env = CompileEnvironment.current()
-        return env.block_sizes[self.block_id].var
-
-    def merge(self, other: TypeInfo, var_name: str | None = None) -> TypeInfo:
-        if isinstance(other, ReductionDimType):
-            if self.block_id == other.block_id:
-                return self
-            raise exc.TypeInferenceError(
-                f"ReductionDimType mismatch in control flow: {self.block_id} and {other.block_id}"
             )
         return super().merge(other, var_name=var_name)
 
@@ -1307,7 +1339,15 @@ class DictType(CollectionType):
 
 class ClassType(DictType):
     def propagate_attribute(self, attr: str, origin: AttributeOrigin) -> TypeInfo:
-        return self.element_types[attr]
+        try:
+            return self.element_types[attr]
+        except KeyError:
+            desc = str(
+                getattr(origin.value, "location", origin.value.__class__.__name__)
+            )
+            raise exc.TypeInferenceError(
+                f"Attribute '{attr}' is not supported on {desc}"
+            ) from None
 
 
 class StackTensorType(ClassType):
@@ -1609,10 +1649,10 @@ class TypePropagation(ast.NodeVisitor):
     def _bool_op(self, op: ast.boolop, left: TypeInfo, right: TypeInfo) -> TypeInfo:
         try:
             val = left.truth_value()
-            if isinstance(op, ast.Or) and val is False:
-                return left
-            if isinstance(op, ast.And) and val is True:
-                return right
+            if isinstance(op, ast.Or):
+                return left if val is True else right
+            if isinstance(op, ast.And):
+                return right if val is True else left
         except NotImplementedError:
             pass
         if (
@@ -1710,6 +1750,10 @@ class TypePropagation(ast.NodeVisitor):
                 and rhs.origin.is_device()
             ):
                 raise exc.CannotModifyHostVariableOnDevice(lhs.id) from None
+            if isinstance(rhs, TileIndexType):
+                CompileEnvironment.current().block_sizes[rhs.block_id].add_debug_name(
+                    lhs.id
+                )
             return self.scope.set(lhs.id, rhs)
         if isinstance(lhs, ast.Starred):
             try:
@@ -1872,13 +1916,32 @@ class TypePropagation(ast.NodeVisitor):
             pass
         else:
             try:
+                # Special case: if this is Tile + offset pattern, expand to tile.index + offset
+                if (
+                    isinstance(node.op, ast.Add)
+                    and isinstance(left, TileIndexType)
+                    and isinstance(right, (SymIntType, LiteralType, NumericType))
+                ):
+                    # Expand tile + offset to tile.index + offset
+                    tile_index = left.propagate_attribute(
+                        "index", AttributeOrigin(self.origin(), "index")
+                    )
+                    return TypeInfo.from_example(
+                        _eval_binary(node.op, tile_index.proxy(), right.proxy()),
+                        self.origin(),
+                    )
+
                 return TypeInfo.from_example(
                     _eval_binary(node.op, left_example, right_example),
                     self.origin(),
                 )
             except exc.Base:
                 raise
-            except Exception as e:
+            except TypeError as e:
+                # Re-raise as TorchOpTracingError for proper error handling in visit_AugAssign
+                raise exc.TorchOpTracingError(e) from e
+            except RuntimeError as e:
+                # Re-raise as TorchOpTracingError for proper error handling in visit_AugAssign
                 raise exc.TorchOpTracingError(e) from e
 
         raise exc.TypeInferenceError(
@@ -1920,8 +1983,11 @@ class TypePropagation(ast.NodeVisitor):
 
     def visit_Call(self, node: ast.Call) -> TypeInfo:
         # TODO(jansel): test handling if *args and **kwargs
-        # TODO(jansel): check for calling a Kernel here
         func = self.visit(node.func)
+
+        # Check for calling a Helion kernel from within another Helion kernel
+        if isinstance(func, CallableType) and isinstance(func.value, Kernel):
+            raise exc.NestedKernelCallsNotSupported
 
         if (
             isinstance(func, CallableType)
@@ -2028,14 +2094,25 @@ class TypePropagation(ast.NodeVisitor):
 
     def visit_AugAssign(self, node: ast.AugAssign) -> TypeInfo:
         assert isinstance(node.target, ExtendedAST)
-        type_info = self.visit(
-            create(
-                ast.BinOp,
-                left=node.target.copy(ctx=ast.Load()),
-                op=node.op,
-                right=node.value,
+        try:
+            type_info = self.visit(
+                create(
+                    ast.BinOp,
+                    left=node.target.copy(ctx=ast.Load()),
+                    op=node.op,
+                    right=node.value,
+                )
             )
-        )
+        except exc.TorchOpTracingError as e:
+            # Check if this is a shape mismatch when modifying a host variable in device loop
+            if (
+                isinstance(node.target, ast.Name)
+                and (existing_type := self.scope.maybe_get(node.target.id)) is not None
+                and existing_type.origin.is_host()
+                and self.device_loop_depth > 0
+            ):
+                raise exc.CannotModifyHostVariableOnDevice(node.target.id) from e
+            raise
         self._assign(node.target, type_info)
         return NoType(origin=self.origin())
 
@@ -2126,12 +2203,18 @@ class TypePropagation(ast.NodeVisitor):
                     raise exc.NestedGridLoop
 
         self.device_loop_depth += device_loop
-        body = self._loop_body(node.body)
-        with self.swap_scope(body):
-            # second pass for fixed point
-            body.merge(self._loop_body(node.body))
-        orelse = self._body(node.orelse)
-        self.scope.merge_if_else(body, orelse)
+        _maybe_patch_tensor_factories = (
+            patch_tensor_factories
+            if self.device_loop_depth > 0
+            else contextlib.nullcontext
+        )
+        with _maybe_patch_tensor_factories():
+            body = self._loop_body(node.body)
+            with self.swap_scope(body):
+                # second pass for fixed point
+                body.merge(self._loop_body(node.body))
+            orelse = self._body(node.orelse)
+            self.scope.merge_if_else(body, orelse)
         self.device_loop_depth -= device_loop
         return NoType(origin=self.origin())
 
@@ -2264,14 +2347,12 @@ def _to_proxy(arg: TypeInfo) -> object:
         raise exc.TracedArgNotSupported(arg) from None
 
 
-def propagate_types(func: HostFunction, fake_args: list[object]) -> None:
+def propagate_types(func: HostFunction) -> None:
     # Lock needed since patch.object(torch.SymInt.__index__, ...) is not thread safe
     with compile_lock, func, enable_python_dispatcher():
         global_scope = GlobalScope(function=func)
         local_scope = LocalScope(parent=global_scope)
-        params = inspect.signature(func.fn).bind(*fake_args)
-        params.apply_defaults()
-        for name, value in params.arguments.items():
+        for name, value in func.params.arguments.items():
             # TODO(jansel): handle specializations/constexpr
             type_info = TypeInfo.from_example(
                 value,

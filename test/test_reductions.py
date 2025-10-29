@@ -6,6 +6,7 @@ import unittest
 import torch
 
 import helion
+from helion._compat import supports_tensor_descriptor
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
@@ -79,7 +80,7 @@ class TestReductions(RefEagerTestBase, TestCase):
 
     @skipIfRefEager("Does not call assert_close")
     def test_broken_layernorm(self):
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def layer_norm_fwd(
             x: torch.Tensor,
             weight: torch.Tensor,
@@ -120,29 +121,38 @@ class TestReductions(RefEagerTestBase, TestCase):
         torch.testing.assert_close(output, args[0].sum(-1), rtol=1e-04, atol=1e-04)
         self.assertExpectedJournal(code)
 
+    @unittest.skipUnless(
+        supports_tensor_descriptor(), "Tensor descriptor support is required"
+    )
     def test_sum_keepdims(self):
         args = (torch.randn([512, 512], device=DEVICE),)
         code, output = code_and_output(
-            sum_kernel_keepdims, args, block_size=16, indexing="block_ptr"
+            sum_kernel_keepdims, args, block_size=16, indexing="tensor_descriptor"
         )
         torch.testing.assert_close(
             output, args[0].sum(0, keepdim=True), rtol=1e-04, atol=1e-04
         )
         self.assertExpectedJournal(code)
 
+    @unittest.skipUnless(
+        supports_tensor_descriptor(), "Tensor descriptor support is required"
+    )
     def test_argmin_argmax(self):
         for fn in (torch.argmin, torch.argmax):
             args = (torch.randn([512, 512], device=DEVICE), fn, torch.int64)
             code, output = code_and_output(
-                reduce_kernel, args, block_size=16, indexing="block_ptr"
+                reduce_kernel, args, block_size=16, indexing="tensor_descriptor"
             )
             torch.testing.assert_close(output, args[1](args[0], dim=-1))
         self.assertExpectedJournal(code)
 
+    @unittest.skipUnless(
+        supports_tensor_descriptor(), "Tensor descriptor support is required"
+    )
     def test_reduction_functions(self):
         for reduction_loop in (None, 16):
             for block_size in (1, 16):
-                for indexing in ("block_ptr", "pointer"):
+                for indexing in ("tensor_descriptor", "pointer"):
                     for fn in (
                         torch.amax,
                         torch.amin,
@@ -162,11 +172,14 @@ class TestReductions(RefEagerTestBase, TestCase):
                             output, fn(args[0], dim=-1), rtol=1e-3, atol=1e-3
                         )
 
+    @unittest.skipUnless(
+        supports_tensor_descriptor(), "Tensor descriptor support is required"
+    )
     def test_mean(self):
         args = (torch.randn([512, 512], device=DEVICE), torch.mean, torch.float32)
         self.assertExpectedJournal(reduce_kernel.bind(args)._debug_str())
         code, output = code_and_output(
-            reduce_kernel, args, block_size=8, indexing="block_ptr"
+            reduce_kernel, args, block_size=8, indexing="tensor_descriptor"
         )
         torch.testing.assert_close(output, args[1](args[0], dim=-1))
         self.assertExpectedJournal(code)
@@ -179,6 +192,9 @@ class TestReductions(RefEagerTestBase, TestCase):
         torch.testing.assert_close(output, args[0].sum(-1), rtol=1e-04, atol=1e-04)
         self.assertExpectedJournal(code)
 
+    @unittest.skipUnless(
+        supports_tensor_descriptor(), "Tensor descriptor support is required"
+    )
     def test_argmin_argmax_looped(self):
         for fn in (torch.argmin, torch.argmax):
             args = (torch.randn([512, 512], device=DEVICE), fn, torch.int64)
@@ -186,7 +202,7 @@ class TestReductions(RefEagerTestBase, TestCase):
                 reduce_kernel,
                 args,
                 block_size=1,
-                indexing="block_ptr",
+                indexing="tensor_descriptor",
                 reduction_loop=16,
             )
             torch.testing.assert_close(output, args[1](args[0], dim=-1))
@@ -195,7 +211,7 @@ class TestReductions(RefEagerTestBase, TestCase):
     def test_reduction_loops_integer_values(self):
         """Test that reduction_loops with integer values works (issue #345 fix)."""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def layer_norm_reduction(
             x: torch.Tensor,
             weight: torch.Tensor,
@@ -290,7 +306,7 @@ class TestReductions(RefEagerTestBase, TestCase):
     def test_fp16_math_ops_fp32_fallback(self):
         """Test that mathematical ops with fp16/bfloat16 inputs now work via fp32 fallback."""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def rsqrt_fp16_kernel(x: torch.Tensor) -> torch.Tensor:
             result = torch.empty_like(x)
             for tile in hl.tile(x.size(0)):
@@ -298,7 +314,7 @@ class TestReductions(RefEagerTestBase, TestCase):
                 result[tile] = torch.rsqrt(x[tile])
             return result
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def multi_math_ops_fp16_kernel(x: torch.Tensor) -> torch.Tensor:
             result = torch.empty([x.size(0), 8], dtype=x.dtype, device=x.device)
             for tile in hl.tile(x.size(0)):
@@ -387,6 +403,85 @@ class TestReductions(RefEagerTestBase, TestCase):
 
             # Verify result maintains bfloat16 dtype
             self.assertEqual(result_bf16.dtype, torch.bfloat16)
+
+    @unittest.skipUnless(
+        supports_tensor_descriptor(), "Tensor descriptor support is required"
+    )
+    def test_layer_norm_nonpow2_reduction(self):
+        """Test layer norm with non-power-of-2 reduction dimension (1536)."""
+
+        @helion.kernel(
+            config=helion.Config(
+                block_sizes=[2],
+                indexing="tensor_descriptor",
+                num_stages=4,
+                num_warps=4,
+                pid_type="flat",
+            ),
+            static_shapes=True,
+        )
+        def layer_norm_fwd_nonpow2(
+            x: torch.Tensor,
+            weight: torch.Tensor,
+            bias: torch.Tensor,
+            eps: float = 1e-5,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            m, n = x.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            mean = torch.empty([m], dtype=torch.float32, device=x.device)
+            rstd = torch.empty([m], dtype=torch.float32, device=x.device)
+
+            for tile_m in hl.tile(m):
+                acc = x[tile_m, :].to(torch.float32)
+                # Compute mean
+                mean_val = torch.sum(acc, dim=-1) / n
+                # Compute variance
+                centered = acc - mean_val[:, None]
+                var_val = torch.sum(centered * centered, dim=-1) / n
+                # Compute reciprocal standard deviation
+                rstd_val = torch.rsqrt(var_val + eps)
+                # Normalize
+                normalized = centered * rstd_val[:, None]
+                # Apply affine transformation
+                acc = normalized * (weight[:].to(torch.float32)) + (
+                    bias[:].to(torch.float32)
+                )
+                out[tile_m, :] = acc.to(x.dtype)
+                mean[tile_m] = mean_val
+                rstd[tile_m] = rstd_val
+            return out, mean, rstd
+
+        batch_size = 4096
+        dim = 1536  # Non-power-of-2 to trigger padding
+
+        # Use tritonbench-style input distribution
+        torch.manual_seed(42)
+        x = -2.3 + 0.5 * torch.randn(
+            [batch_size, dim], device=DEVICE, dtype=torch.float16
+        )
+        weight = torch.randn([dim], device=DEVICE, dtype=torch.float16)
+        bias = torch.randn([dim], device=DEVICE, dtype=torch.float16)
+        eps = 1e-4
+
+        code, (out, mean, rstd) = code_and_output(
+            layer_norm_fwd_nonpow2,
+            (x, weight, bias, eps),
+        )
+
+        # Compute expected result
+        x_fp32 = x.to(torch.float32)
+        mean_ref = x_fp32.mean(dim=1)
+        var_ref = x_fp32.var(dim=1, unbiased=False)
+        rstd_ref = torch.rsqrt(var_ref + eps)
+        normalized_ref = (x_fp32 - mean_ref[:, None]) * rstd_ref[:, None]
+        out_ref = (normalized_ref * weight.float() + bias.float()).half()
+
+        # Check outputs
+        torch.testing.assert_close(out, out_ref, rtol=1e-3, atol=1e-3)
+        torch.testing.assert_close(mean, mean_ref, rtol=1e-5, atol=1e-5)
+        torch.testing.assert_close(rstd, rstd_ref, rtol=1e-5, atol=1e-5)
+
+        self.assertExpectedJournal(code)
 
 
 if __name__ == "__main__":

@@ -1,14 +1,17 @@
 <div align="center">
-  <img src="https://github.com/user-attachments/assets/f48e4545-8c55-41b5-bd96-703c92ade1ba" alt="drawing" width="250"/>
+  <img src="docs/_static/helion_nobackground.png" alt="Helion Logo" width="250"/>
 </div>
 
+# News
 
-# Helion
+- **Oct. 21, 2025**: Talk at [2025 Triton Developer Conference](https://tritonconference.eventbuilder.com/TritonDeveloperConference?ref=TritonDeveloperConference) - Helion: A Higher-level DSL for Kernel Authoring
+- **Oct. 22, 2025**: [Meet the Developers of PyTorch Compiler and Helion](https://pytorchconference.sched.com/event/27QN9/meet-the-developers-of-pytorch-compiler-and-helion?iframe=no) at PyTorch Conference 2025
+- **Oct. 23, 2025**: Talk at PyTorch Conference 2025 - [Helion: A High-level DSL for Kernel Authoring](https://pytorchconference.sched.com/event/27QDl/helion-a-high-level-dsl-for-kernel-authoring-jason-ansel-meta?iframe=no)
+- **Dec. 11, 2025**: PyTorch Webinar - [Inside Helion: Live Q&A with the Developers](https://pytorch.org/event/inside-helion-live-qa/)
 
-📚 **[View Documentation](https://helionlang.com)** 📚
+# About
 
-> ⚠️ **Early Development Warning**
-> Helion is currently in an experimental stage. You should expect bugs, incomplete features, and APIs that may change in future versions. Feedback and bug reports are welcome and appreciated!
+📚 **[View Documentation](https://helionlang.com)** 📚 | 🎥 **[Watch Talk](https://youtu.be/MBOPzfl1JBo?si=DwAhgL-bpH1kFSt3)** 🎥 | 🚀 **[Try In Colab](https://colab.research.google.com/github/pytorch/helion/blob/main/notebooks/softmax.ipynb)** 🚀
 
 **Helion** is a Python-embedded domain-specific language (DSL) for
 authoring machine learning kernels, designed to compile down to [Triton],
@@ -32,6 +35,7 @@ portable between different hardware. Helion automates and autotunes over:
 
    * Automatically calculates strides and indices.
    * Autotunes choices among various indexing methods (pointers, block pointers, TensorDescriptors).
+   * Supports per-operation indexing strategies for fine-grained memory access control of loads and stores.
 
 2. **Masking:**
 
@@ -62,7 +66,6 @@ portable between different hardware. Helion automates and autotunes over:
    * Loop reordering.
    * Persistent kernel strategies.
    * Warp specialization choices, unrolling, and more.
-
 
 ## Example
 
@@ -186,6 +189,18 @@ and configurations directly from your code.
 
 **For production deployment**, we recommend using ahead-of-time tuned configurations rather than relying on runtime autotuning. The autotuning process can be time-consuming and resource-intensive, making it unsuitable for production environments where predictable performance and startup times are critical.
 
+### Static shapes and autotuning keys
+
+By default Helion uses static shapes (`static_shapes=True`). This means each unique input shape/stride signature is treated as its own specialization and will be autotuned separately. This typically yields the best performance, but may increase autotuning time when many shapes are encountered.
+
+If you want to reduce autotuning time by sharing configurations between different shapes, set `static_shapes=False`. In this mode, the autotuning key ignores exact sizes, allowing a single tuned config to be reused across multiple shapes. This can come with a performance penalty compared to fully specialized static shapes.
+
+```python
+@helion.kernel(static_shapes=False)
+def my_kernel(x: torch.Tensor) -> torch.Tensor:
+    ...
+```
+
 ## Configurations
 
 Helion configurations include the following options:
@@ -243,10 +258,15 @@ Reorders the program IDs (PIDs) of the generated kernel for improved L2
 cache behavior. A value of `1` disables this optimization, while higher
 values specify the grouping size.
 
-* **indexing** (`"pointer"`, `"tensor_descriptor"` or `"block_ptr"`):
-Specifies the type of indexing code to generate. The `"tensor_descriptor"`
-option uses Tensor Memory Accelerators (TMAs) but requires a Hopper or
-newer GPU and the latest development version of Triton.
+* **indexing** (`"pointer"`, `"tensor_descriptor"`, `"block_ptr"`, or a list of these):
+Specifies the memory indexing strategy for load and store operations. Can be:
+  - A single strategy (applies to all loads and stores): `indexing="block_ptr"`
+  - A list of strategies (one per load/store in execution order): `indexing=["pointer", "pointer", "block_ptr"]`
+  - Empty/omitted (defaults to `"pointer"` for all operations)
+  - When using a list, provide strategies in order: `[load1, load2, ..., store1, store2, ...]`
+
+  The `"tensor_descriptor"` option uses Tensor Memory Accelerators (TMAs) but
+  requires a Hopper or newer GPU and the latest development version of Triton.
 
 * **pid\_type** (`"flat"`, `"xyz"`, `"persistent_blocked"`, or `"persistent_interleaved"`):
   Specifies the program ID mapping strategy. `"flat"` uses only the x-dimension,
@@ -259,6 +279,12 @@ Sets the number of warps the kernel will use.
 * **num\_stages** (`int`):
 Defines the number of pipeline stages to be passed to Triton.
 
+* **load_eviction_policies** (`list[str]`):
+Controls eviction policy used for loads discovered in device loops. Each entry
+corresponds to a load site; allowed values are `""` (no policy), `"first"`
+(maps to Triton `evict_first`), and `"last"` (maps to Triton `evict_last`).
+Explicit `eviction_policy=...` on `hl.load` overrides this config.
+
 Changing these options results in often significantly different
 output Triton code, allowing the autotuner to explore a wide range of
 implementations from a single Helion kernel.
@@ -266,14 +292,18 @@ implementations from a single Helion kernel.
 ## Settings for Development and Debugging
 
 When developing kernels with Helion, you might prefer skipping autotuning for faster iteration. To
-do this, set the environment variable `HELION_USE_DEFAULT_CONFIG=1` or use the decorator argument
-`@helion.kernel(use_default_config=True)`. **Warning:** The default configuration is slow and not intended for
+do this, set the environment variable `HELION_AUTOTUNE_EFFORT=none` or use the decorator argument
+`@helion.kernel(autotune_effort="none")`. **Warning:** The default configuration is slow and not intended for
 production or performance testing.
 
 To view the generated Triton code, set the environment variable `HELION_PRINT_OUTPUT_CODE=1` or include
 `print_output_code=True` in the `@helion.kernel` decorator. This prints the Triton code to `stderr`, which is
 helpful for debugging and understanding Helion's compilation process.  One can also use
 `foo_kernel.bind(args).to_triton_code(config)` to get the Triton code as a string.
+
+Within an `hl.tile`/`hl.grid` device loop, if you want to print intermediate results using `print("x", ...)` syntax,
+or pause execution using Python's built-in `breakpoint()`, set either `TRITON_INTERPRET=1` (runs Triton's CPU interpreter)
+or `HELION_INTERPRET=1` (runs the Helion kernel in eager mode).
 
 To force autotuning, bypassing provided configurations, set `HELION_FORCE_AUTOTUNE=1` or invoke `foo_kernel.autotune(args,
 force=True)`.
@@ -293,9 +323,9 @@ for DEBUG-level logs. Alternatively, you can specify logging for specific module
 Helion currently targets Linux systems and requires a recent Python and PyTorch environment:
 
 - Linux-based OS
-- Python 3.10, 3.11, or 3.12
-- [PyTorch] nightly build
-- A development version of [Triton], installed from source
+- Python 3.10–3.14
+- [PyTorch] 2.9 or later
+- [Triton] 3.5 or later
   *(Older versions may work, but will lack support for features like
   TMA on Hopper/Blackwell GPUs and may exhibit lower performance.)*
 
@@ -303,26 +333,52 @@ Helion currently targets Linux systems and requires a recent Python and PyTorch 
 
 ## Installation
 
-We recommend using a [conda] environment to manage dependencies. First,
+We recommend using [uv] to manage an isolated virtual environment. First,
 install compatible versions of [PyTorch] and [Triton].
 
-[conda]: https://www.anaconda.com/docs/getting-started/miniconda/install
+[uv]: https://docs.astral.sh/uv/
 
-Once your environment is set up, you can install Helion directly from GitHub:
+Once your environment is set up, you can install Helion:
 
 ```bash
-pip install git+https://github.com/pytorch/helion.git
+pip install helion
 ```
 
-Alternatively, you may install from source for development purposes:
+Alternatively, you may install from source for development purposes. If using `uv`, create and activate a virtual environment first:
 ```bash
 git clone https://github.com/pytorch/helion.git
 cd helion
+
+# Create and activate a virtual environment with uv (one-time)
+uv venv .venv
+source .venv/bin/activate
+
 # To install in editable w/ required dev packages
 pip install -e .'[dev]'
-````
+```
 This installs Helion in "editable" mode so that changes to the source
 code take effect without needing to reinstall.
+
+## Linting
+
+We use `pre-commit` to run ruff, pyright, and other checks automatically.
+
+– One-time setup (installs the git hook):
+```bash
+pip install pre-commit
+pre-commit install
+```
+
+– Run all checks across the repository:
+```bash
+pre-commit run --all-files
+```
+
+Note: You can still run the underlying tools directly via `./lint.sh [fix|check|unsafe]`.
+
+## Community
+
+Questions or feedback? Join us on the [GPU MODE Discord](https://discord.gg/gpumode) in the `#helion` channel.
 
 ## License
 

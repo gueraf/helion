@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import contextvars
-import functools
 from typing import TYPE_CHECKING
 
 import torch
 
+from .. import _compat as _compat  # ensure Triton compatibility patches run
 from .config import Config as Config
 from .kernel import Kernel as Kernel
 from .kernel import kernel as kernel
@@ -21,7 +21,6 @@ def _alloc_fn(size: int, alignment: int, stream: int | None) -> torch.Tensor:
     return torch.empty(size, device="cuda", dtype=torch.int8)
 
 
-@functools.cache
 def set_triton_allocator() -> None:
     try:
         from triton import set_allocator
@@ -48,8 +47,11 @@ def get_num_sm(device: torch.device) -> int:
     Returns:
         Grid size to use for a persistent kernel on the device.
     """
-    assert device.type == "cuda", "TODO: implement for other devices"
-    return torch.cuda.get_device_properties(device.index).multi_processor_count
+    assert device.type in ["cuda", "xpu"], "TODO: implement for other devices"
+    if device.type == "cuda":
+        return torch.cuda.get_device_properties(device.index).multi_processor_count
+    # TODO(EikanWang): gpu_subslice_count is an out-of-date term. we change update it to XeCore number.
+    return torch.xpu.get_device_properties(device.index).gpu_subslice_count
 
 
 def default_launcher(
@@ -58,8 +60,14 @@ def default_launcher(
     *args: object,
     num_warps: int,
     num_stages: int,
+    **kwargs: dict,
 ) -> object:
     """Default launcher function that executes the kernel immediately."""
     return triton_kernel.run(
-        *args, grid=grid, warmup=False, num_warps=num_warps, num_stages=num_stages
+        *args,
+        grid=grid,
+        warmup=False,
+        num_warps=num_warps,
+        num_stages=num_stages,
+        **kwargs,
     )

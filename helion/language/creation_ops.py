@@ -36,6 +36,7 @@ def zeros(
     Args:
         shape: A list of sizes (or tile indices which are implicitly converted to sizes)
         dtype: Data type of the tensor (default: torch.float32)
+        device: Device must match the current compile environment device
 
     Returns:
         torch.Tensor: A device tensor of the given shape and dtype filled with zeros
@@ -82,6 +83,7 @@ def full(
         shape: A list of sizes (or tile indices which are implicitly converted to sizes)
         value: The value to fill the tensor with
         dtype: The data type of the tensor (default: torch.float32)
+        device: Device must match the current compile environment device
 
     Returns:
         torch.Tensor: A device tensor of the given shape and dtype filled with value
@@ -141,7 +143,9 @@ def _full_codegen(state: CodegenState) -> ast.AST:
         return expr_from_string(f"tl.full({shape_str}, {value_str}, {type_str})")
     # For dynamic values, use ast_arg to get the proper AST representation
     value_ast = state.ast_arg(1)
-    return expr_from_string(f"tl.full({shape_str}, value, {type_str})", value=value_ast)
+    return expr_from_string(
+        f"tl.full({shape_str}, {{value}}, {type_str})", value=value_ast
+    )
 
 
 @_decorators.get_masked_value(full)
@@ -190,9 +194,10 @@ def arange(
     automatically using the current kernel's device and index dtype.
 
     Args:
-        *args: Variable arguments passed to torch.arange(start, end, step).
+        args: Positional arguments passed to torch.arange(start, end, step).
         dtype: Data type of the result tensor (defaults to kernel's index dtype)
-        **kwargs: Additional keyword arguments passed to torch.arange
+        device: Device must match the current compile environment device
+        kwargs: Additional keyword arguments passed to torch.arange
 
     Returns:
         torch.Tensor: 1D tensor containing the sequence

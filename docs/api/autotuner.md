@@ -2,6 +2,8 @@
 
 The `helion.autotuner` module provides automatic optimization of kernel configurations.
 
+Autotuning effort can be adjusted via :attr:`helion.Settings.autotune_effort`, which configures how much each algorithm explores (``"none"`` disables autotuning, ``"quick"`` runs a smaller search, ``"full"`` uses the full search budget). Users may still override individual autotuning parameters if they need finer control.
+
 ```{eval-rst}
 .. currentmodule:: helion.autotuner
 
@@ -25,6 +27,13 @@ The `helion.autotuner` module provides automatic optimization of kernel configur
 
 The autotuner supports multiple search strategies:
 
+### Pattern Search
+
+```{eval-rst}
+.. automodule:: helion.autotuner.pattern_search
+   :members:
+```
+
 ### Differential Evolution
 
 ```{eval-rst}
@@ -43,5 +52,12 @@ The autotuner supports multiple search strategies:
 
 ```{eval-rst}
 .. automodule:: helion.autotuner.finite_search
+   :members:
+```
+
+### Local Cache
+
+```{eval-rst}
+.. automodule:: helion.autotuner.local_cache
    :members:
 ```

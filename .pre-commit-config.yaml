@@ -1,6 +1,6 @@
 repos:
 -   repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v5.0.0
+    rev: v6.0.0
     hooks:
     - id: check-symlinks
     - id: destroyed-symlinks
@@ -15,12 +15,14 @@ repos:
     - id: check-merge-conflict
     - id: check-executables-have-shebangs
     - id: check-shebang-scripts-are-executable
+    - id: requirements-txt-fixer
     - id: detect-private-key
     - id: debug-statements
+      exclude: 'test/test_breakpoint\.py$'
 
 -   repo: https://github.com/astral-sh/ruff-pre-commit
     # Ruff version.
-    rev: v0.11.13
+    rev: v0.14.2
     hooks:
       # Run the linter.
       - id: ruff
@@ -35,6 +37,11 @@ repos:
         entry: python scripts/lint_examples_main.py
         language: system
         files: ^examples/.*\.py$
+      - id: check-no-hardcoded-device
+        name: disallow hard-coded device kwarg outside of DEVICE
+        entry: python scripts/lint_no_hardcoded_device.py
+        language: system
+        files: ^(?:examples|test)/.*\.py$
 
 -   repo: https://github.com/codespell-project/codespell
     rev: v2.4.1
@@ -44,7 +51,7 @@ repos:
           - tomli
 
 -   repo: https://github.com/RobertCraigie/pyright-python
-    rev: v1.1.403
+    rev: v1.1.407
     hooks:
       - id: pyright
         language: system

@@ -7,6 +7,7 @@ import torch
 
 import helion
 from helion import _compat
+from helion._compat import supports_tensor_descriptor
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
@@ -33,6 +34,9 @@ def grid_2d_pytorch(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 
 class TestGrid(RefEagerTestBase, TestCase):
+    @unittest.skipUnless(
+        supports_tensor_descriptor(), "Tensor descriptor support is required"
+    )
     @patch.object(_compat, "_min_dot_size", lambda *args: (16, 16, 16))
     def test_grid_1d(self):
         @helion.kernel(static_shapes=True)
@@ -72,11 +76,14 @@ class TestGrid(RefEagerTestBase, TestCase):
 
         # test again with block_ptr indexing
         code, result = code_and_output(
-            grid_1d, args, block_sizes=[16, 16, 16], indexing="block_ptr"
+            grid_1d, args, block_sizes=[16, 16, 16], indexing="tensor_descriptor"
         )
         torch.testing.assert_close(result, grid_1d_pytorch(args[0], args[1]))
         self.assertExpectedJournal(code)
 
+    @unittest.skipUnless(
+        supports_tensor_descriptor(), "Tensor descriptor support is required"
+    )
     def test_grid_2d_idx_list(self):
         @helion.kernel(static_shapes=True)
         def grid_2d_idx_list(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -111,7 +118,10 @@ class TestGrid(RefEagerTestBase, TestCase):
         self.assertExpectedJournal(code)
 
         code, result = code_and_output(
-            grid_2d_idx_list, args, block_sizes=[64, 32, 16], indexing="block_ptr"
+            grid_2d_idx_list,
+            args,
+            block_sizes=[64, 32, 16],
+            indexing="tensor_descriptor",
         )
         torch.testing.assert_close(result, grid_2d_pytorch(args[0], args[1]))
         self.assertExpectedJournal(code)
@@ -150,7 +160,7 @@ class TestGrid(RefEagerTestBase, TestCase):
         self.assertExpectedJournal(code)
 
     def test_grid_begin_end(self):
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def grid_begin_end(x: torch.Tensor) -> torch.Tensor:
             n = x.size(0)
             out = torch.zeros_like(x)
@@ -171,7 +181,7 @@ class TestGrid(RefEagerTestBase, TestCase):
         self.assertExpectedJournal(code)
 
     def test_grid_begin_end_step(self):
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def grid_begin_end_step(x: torch.Tensor) -> torch.Tensor:
             n = x.size(0)
             out = torch.zeros_like(x)
@@ -192,7 +202,7 @@ class TestGrid(RefEagerTestBase, TestCase):
         self.assertExpectedJournal(code)
 
     def test_grid_end_step_kwarg(self):
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def grid_end_step_kwarg(x: torch.Tensor) -> torch.Tensor:
             n = x.size(0)
             out = torch.zeros_like(x)
@@ -213,7 +223,7 @@ class TestGrid(RefEagerTestBase, TestCase):
         self.assertExpectedJournal(code)
 
     def test_grid_multidim_begin_end(self):
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def grid_multidim_begin_end(x: torch.Tensor) -> torch.Tensor:
             m, n = x.size()
             out = torch.zeros_like(x)
@@ -237,7 +247,7 @@ class TestGrid(RefEagerTestBase, TestCase):
         self.assertExpectedJournal(code)
 
     def test_grid_multidim_begin_end_step(self):
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def grid_multidim_begin_end_step(x: torch.Tensor) -> torch.Tensor:
             m, n = x.size()
             out = torch.zeros_like(x)
@@ -261,7 +271,7 @@ class TestGrid(RefEagerTestBase, TestCase):
         self.assertExpectedJournal(code)
 
     def test_tile_begin_end(self):
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def tile_begin_end(x: torch.Tensor) -> torch.Tensor:
             out = torch.zeros_like(x)
             for tile in hl.tile(2, 10):  # tile(begin, end) - simple range [2, 10)
@@ -283,7 +293,7 @@ class TestGrid(RefEagerTestBase, TestCase):
     def test_range_as_grid_basic(self):
         """Test that range() works as an alias for hl.grid() in device code."""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def range_kernel(x: torch.Tensor) -> torch.Tensor:
             batch = x.size(0)
             out = x.new_zeros(batch)
@@ -303,7 +313,7 @@ class TestGrid(RefEagerTestBase, TestCase):
     def test_range_with_begin_end(self):
         """Test that range(begin, end) works as alias for hl.grid(begin, end)."""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def range_begin_end_kernel(x: torch.Tensor) -> torch.Tensor:
             batch = x.size(0)
             out = x.new_zeros(batch)
@@ -323,7 +333,7 @@ class TestGrid(RefEagerTestBase, TestCase):
     def test_range_with_step(self):
         """Test that range(begin, end, step) works as alias for hl.grid(begin, end, step)."""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def range_step_kernel(x: torch.Tensor) -> torch.Tensor:
             batch = x.size(0)
             out = x.new_zeros(batch)
@@ -346,7 +356,7 @@ class TestGrid(RefEagerTestBase, TestCase):
     def test_range_with_tensor_size(self):
         """Test that range(tensor.size(dim)) works with dynamic tensor dimensions."""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def range_tensor_size_kernel(x: torch.Tensor) -> torch.Tensor:
             batch = x.size(0)
             out = x.new_zeros(batch)
